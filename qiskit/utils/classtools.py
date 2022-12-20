@@ -101,14 +101,15 @@ class _WrappedMethod:
             self._method = method
         # If the inner method doesn't have `__get__` (like some builtin methods), it's faster to
         # test a Boolean each time than the repeatedly raise and catch an exception, which is what
-        # `hasattr` does.
-        self._method_has_get = hasattr(self._method, "__get__")
+        # `hasattr` does. Moreover, depending on the Python version, some magic methods' `__get__`
+        # method return an unbound version of the method, which we avoid by also checking `__self__`
+        self._use_get = hasattr(self._method, "__get__") and not hasattr(self._method, "__self__")
 
     def __get__(self, obj, objtype=None):
         # `self._method` doesn't invoke the `_method` descriptor (if it is one) because that only
         # happens for class variables. Here it's an instance variable, so we can pass through `obj`
         # and `objtype` correctly like this.
-        method = self._method.__get__(obj, objtype) if self._method_has_get else self._method
+        method = self._method.__get__(obj, objtype) if self._use_get else self._method
 
         @functools.wraps(method)
         def out(*args, **kwargs):
