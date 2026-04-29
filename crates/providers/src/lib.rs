@@ -10,6 +10,8 @@
 // copyright notice, and modified files need to carry a notice indicating
 // that they have been altered from the originals.
 
+mod backend_v3;
 mod data_tree;
 
+pub use backend_v3::{BackendV3, ExecutionResult, JobV2, QuantumProgram};
 pub use data_tree::{DataTree, PathEntry};

@@ -2264,6 +2264,7 @@ dependencies = [
  "pyo3",
  "qiskit-circuit",
  "qiskit-circuit-library",
+ "qiskit-providers",
  "qiskit-quantum-info",
  "qiskit-transpiler",
  "rand 0.10.1",
@@ -2343,6 +2344,7 @@ name = "qiskit-providers"
 version = "2.5.0-dev"
 dependencies = [
  "hashbrown 0.15.5",
+ "qiskit-transpiler",
 ]
 
 [[package]]
@@ -2358,12 +2360,14 @@ dependencies = [
  "qiskit-cext-vtable",
  "qiskit-circuit",
  "qiskit-circuit-library",
+ "qiskit-providers",
  "qiskit-qasm2",
  "qiskit-qasm3",
  "qiskit-qpy",
  "qiskit-quantum-info",
  "qiskit-synthesis",
  "qiskit-transpiler",
+ "qiskit-util",
 ]
 
 [[package]]

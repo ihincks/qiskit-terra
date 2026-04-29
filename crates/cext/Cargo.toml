@@ -20,6 +20,7 @@ qiskit-quantum-info.workspace = true
 qiskit-circuit.workspace = true
 qiskit-circuit-library.workspace = true
 qiskit-transpiler.workspace = true
+qiskit-providers.workspace = true
 pyo3 = { workspace = true, optional = true }
 indexmap.workspace = true
 ahash.workspace = true

@@ -14,6 +14,7 @@ use pyo3::prelude::*;
 pub use qiskit_cext::*;
 
 mod capi;
+mod providers;
 
 #[inline(always)]
 #[doc(hidden)]
@@ -98,7 +99,7 @@ fn _accelerate(m: &Bound<PyModule>) -> PyResult<()> {
     add_submodule(m, ::qiskit_transpiler::passes::optimize_clifford_t_mod, "optimize_clifford_t")?;
     add_submodule(m, ::qiskit_transpiler::passes::substitute_pi4_rotations_mod, "substitute_pi4_rotations")?;
     add_submodule(m, ::qiskit_transpiler::passes::synthesize_rz_rotations_mod, "synthesize_rz_rotations")?;
-
     add_submodule(m, ::qiskit_transpiler::passes::convert_to_pauli_rotations_mod, "convert_to_pauli_rotations")?;
+    add_submodule(m, providers::providers, "providers")?;
     Ok(())
 }

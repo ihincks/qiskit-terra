@@ -15,6 +15,7 @@ mod pointers;
 #[cfg(feature = "python_binding")]
 mod py;
 
+pub mod backend;
 pub mod circuit;
 pub mod circuit_library;
 pub mod dag;
