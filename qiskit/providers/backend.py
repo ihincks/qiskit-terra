@@ -21,7 +21,7 @@ import datetime
 
 from qiskit.circuit.gate import Instruction
 from qiskit._accelerate.target import QubitProperties
-from qiskit._accelerate.providers import BaseJobV2, QuantumProgram
+from qiskit._accelerate.providers import BaseBackendV3, BaseJobV2, QuantumProgram
 
 
 class Backend:
@@ -331,7 +331,7 @@ class BackendV2(Backend, ABC):
         """
 
 
-class BackendV3(Backend, ABC):
+class BackendV3(BaseBackendV3, Backend, ABC):
     """Abstract class for Backends
 
     This abstract class is to be used for all Backend objects created by a
@@ -375,6 +375,9 @@ class BackendV3(Backend, ABC):
 
     version = 3
 
+    def __new__(cls, *_args, **_kwargs):
+        return super().__new__(cls)
+
     def __init__(
         self,
         name: str | None = None,
@@ -402,15 +405,14 @@ class BackendV3(Backend, ABC):
                 options
         """
 
+        super().__init__()
         self._options = self._default_options()
-        self._provider = provider
         if fields:
             for field in fields:
                 if field not in self._options:
                     raise AttributeError(f"Options field {field} is not valid for this backend")
             self._options.update_options(**fields)
         self.name = name
-        """Name of the backend."""
         self.description = description
         self._coupling_map = None
 
@@ -604,4 +606,3 @@ class BackendV3(Backend, ABC):
         Returns:
             JobV2: The job object for the run
         """
-

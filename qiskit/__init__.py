@@ -144,6 +144,7 @@ sys.modules["qiskit._accelerate.synthesize_rz_rotations"] = _accelerate.synthesi
 sys.modules["qiskit._accelerate.convert_to_pauli_rotations"] = (
     _accelerate.convert_to_pauli_rotations
 )
+sys.modules["qiskit._accelerate.providers"] = _accelerate.providers
 
 
 from qiskit.exceptions import QiskitError, MissingOptionalLibraryError
