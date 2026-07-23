@@ -569,29 +569,93 @@ macro_rules! impl_tensor_binop {
 impl_tensor_binop!(Add, add, add_tensor, +, "add");
 impl_tensor_binop!(Sub, sub, sub_tensor, -, "sub");
 impl_tensor_binop!(Mul, mul, mul_tensor, *, "mul");
-impl_tensor_binop!(Div, div, div_tensor, /, "div");
 
-// `Rem` is hand-written rather than going through `impl_tensor_binop!` because
-// `num_complex` does not implement `%`, so the complex variants must be omitted.
 impl Tensor {
-    /// Element-wise `%` with NumPy-style broadcasting (real dtypes only).
+    /// Element-wise `/`.
     ///
-    /// Returns [`TensorError::DTypeMismatch`] if the operand dtypes differ or are
-    /// not supported by this op (e.g. complex), and [`TensorError::ShapeMismatch`]
-    /// if the shapes are not broadcast-compatible.
+    /// Float and complex operands divide directly, preserving their dtype.
+    /// Integer and `Bit` operands are cast to `f64` before dividing, so the result 
+    /// is always `F64` and a zero divisor produces `inf`/`-inf`/`NaN` instead of 
+    /// panicking or raising an error.
+    ///
+    /// Returns [`TensorError::DTypeMismatch`] if the operand dtypes differ
+    /// (or do not support this op), and [`TensorError::ShapeMismatch`] if the
+    /// shapes are not broadcast-compatible.
+    pub fn div_tensor(&self, rhs: &Tensor) -> Result<Tensor, TensorError> {
+        broadcast_shape(self.shape(), rhs.shape())?;
+        macro_rules! int_div {
+            ($a:expr, $b:expr) => {
+                Ok(Tensor::F64(
+                    ($a.mapv(|v| v as f64) / $b.mapv(|v| v as f64)).into_shared(),
+                ))
+            };
+        }
+        match (self, rhs) {
+            (Tensor::C128(a), Tensor::C128(b)) => Ok(Tensor::C128((a / b).into_shared())),
+            (Tensor::C64(a), Tensor::C64(b)) => Ok(Tensor::C64((a / b).into_shared())),
+            (Tensor::F64(a), Tensor::F64(b)) => Ok(Tensor::F64((a / b).into_shared())),
+            (Tensor::F32(a), Tensor::F32(b)) => Ok(Tensor::F32((a / b).into_shared())),
+            (Tensor::I64(a), Tensor::I64(b)) => int_div!(a, b),
+            (Tensor::I32(a), Tensor::I32(b)) => int_div!(a, b),
+            (Tensor::I16(a), Tensor::I16(b)) => int_div!(a, b),
+            (Tensor::I8(a), Tensor::I8(b)) => int_div!(a, b),
+            (Tensor::U64(a), Tensor::U64(b)) => int_div!(a, b),
+            (Tensor::U32(a), Tensor::U32(b)) => int_div!(a, b),
+            (Tensor::U16(a), Tensor::U16(b)) => int_div!(a, b),
+            (Tensor::U8(a), Tensor::U8(b)) => int_div!(a, b),
+            _ => Err(TensorError::DTypeMismatch {
+                op: "div",
+                lhs: self.dtype(),
+                rhs: rhs.dtype(),
+            }),
+        }
+    }
+}
+
+impl std::ops::Div for &Tensor {
+    type Output = Tensor;
+    fn div(self, rhs: Self) -> Tensor {
+        self.div_tensor(rhs).unwrap_or_else(|e| panic!("{e}"))
+    }
+}
+
+impl std::ops::Div for Tensor {
+    type Output = Tensor;
+    fn div(self, rhs: Self) -> Tensor {
+        &self / &rhs
+    }
+}
+
+impl Tensor {
+    /// Element-wise `%` (real dtypes only).
+    ///
+    /// Float operands use plain `%` where a zero divisor yields NaN. 
+    /// Integer operands result in `0` on zero divisor.
+    ///
+    /// Returns [`TensorError::DTypeMismatch`] if the operand dtypes differ or
+    /// are not supported by this op (e.g. complex), and
+    /// [`TensorError::ShapeMismatch`] if the shapes are not
+    /// broadcast-compatible.
     pub fn rem_tensor(&self, rhs: &Tensor) -> Result<Tensor, TensorError> {
         broadcast_shape(self.shape(), rhs.shape())?;
+        macro_rules! int_rem {
+            ($variant:ident, $a:expr, $b:expr) => {
+                Tensor::$variant(broadcast_elementwise($a, $b, |&a, &b| {
+                    if b == 0 { 0 } else { a % b }
+                })?)
+            };
+        }
         match (self, rhs) {
             (Tensor::F64(a), Tensor::F64(b)) => Ok(Tensor::F64((a % b).into_shared())),
             (Tensor::F32(a), Tensor::F32(b)) => Ok(Tensor::F32((a % b).into_shared())),
-            (Tensor::I64(a), Tensor::I64(b)) => Ok(Tensor::I64((a % b).into_shared())),
-            (Tensor::I32(a), Tensor::I32(b)) => Ok(Tensor::I32((a % b).into_shared())),
-            (Tensor::I16(a), Tensor::I16(b)) => Ok(Tensor::I16((a % b).into_shared())),
-            (Tensor::I8(a), Tensor::I8(b)) => Ok(Tensor::I8((a % b).into_shared())),
-            (Tensor::U64(a), Tensor::U64(b)) => Ok(Tensor::U64((a % b).into_shared())),
-            (Tensor::U32(a), Tensor::U32(b)) => Ok(Tensor::U32((a % b).into_shared())),
-            (Tensor::U16(a), Tensor::U16(b)) => Ok(Tensor::U16((a % b).into_shared())),
-            (Tensor::U8(a), Tensor::U8(b)) => Ok(Tensor::U8((a % b).into_shared())),
+            (Tensor::I64(a), Tensor::I64(b)) => Ok(int_rem!(I64, a, b)),
+            (Tensor::I32(a), Tensor::I32(b)) => Ok(int_rem!(I32, a, b)),
+            (Tensor::I16(a), Tensor::I16(b)) => Ok(int_rem!(I16, a, b)),
+            (Tensor::I8(a), Tensor::I8(b)) => Ok(int_rem!(I8, a, b)),
+            (Tensor::U64(a), Tensor::U64(b)) => Ok(int_rem!(U64, a, b)),
+            (Tensor::U32(a), Tensor::U32(b)) => Ok(int_rem!(U32, a, b)),
+            (Tensor::U16(a), Tensor::U16(b)) => Ok(int_rem!(U16, a, b)),
+            (Tensor::U8(a), Tensor::U8(b)) => Ok(int_rem!(U8, a, b)),
             _ => Err(TensorError::DTypeMismatch {
                 op: "rem",
                 lhs: self.dtype(),
@@ -1035,6 +1099,37 @@ mod test {
     }
 
     #[test]
+    fn test_div_int_promotes_to_f64_and_zero_divisor_is_inf_nan() {
+        // Integer / integer promotes to F64 (true division): a zero divisor
+        // yields inf/nan instead of panicking.
+        let a = Tensor::from([6_i32, -6, 0]);
+        let b = Tensor::from([3_i32, 0, 0]);
+        let c = a.div_tensor(&b).unwrap();
+        assert_eq!(c.dtype(), DType::F64);
+        let Tensor::F64(arr) = &c else {
+            panic!("expected F64 tensor");
+        };
+        let vals = arr.as_slice().unwrap();
+        assert_eq!(vals[0], 2.0);
+        assert!(vals[1].is_infinite() && vals[1].is_sign_negative());
+        assert!(vals[2].is_nan());
+    }
+
+    #[test]
+    fn test_rem_int_zero_divisor_returns_zero() {
+        // Integer % integer stays integer and yields 0 at a zero divisor,
+        // matching NumPy's `%` (integers can't represent NaN).
+        let a = Tensor::from([7_i32, 6]);
+        let b = Tensor::from([3_i32, 0]);
+        let c = a.rem_tensor(&b).unwrap();
+        assert_eq!(c.dtype(), DType::I32);
+        let Tensor::I32(arr) = &c else {
+            panic!("expected I32 tensor");
+        };
+        assert_eq!(arr.as_slice().unwrap(), &[1, 0]);
+    }
+
+    #[test]
     fn test_arithmetic_complex() {
         let a = Tensor::from([Complex64::new(1.0, 2.0), Complex64::new(3.0, 4.0)]);
         let b = Tensor::from([Complex64::new(5.0, 6.0), Complex64::new(7.0, 8.0)]);
@@ -1241,7 +1336,8 @@ mod test {
     fn test_binops_dtype_dispatch() {
         let mut fails: Vec<String> = vec![];
 
-        // Check Add/Sub/Mul/Div/Rem with all real dtypes
+        // Check Add/Sub/Mul/Rem with all real dtypes. Div is checked
+        // separately below since it promotes integer inputs to F64.
         macro_rules! check_real {
             ($variant:ident, $t:ty) => {{
                 let a = Tensor::from([6 as $t, 4 as $t]);
@@ -1250,7 +1346,6 @@ mod test {
                     ("add", &a + &b, [9 as $t, 6 as $t]),
                     ("sub", &a - &b, [3 as $t, 2 as $t]),
                     ("mul", &a * &b, [18 as $t, 8 as $t]),
-                    ("div", &a / &b, [2 as $t, 2 as $t]),
                     ("rem", &a % &b, [0 as $t, 0 as $t]),
                 ] {
                     if let Tensor::$variant(arr) = got {
@@ -1276,6 +1371,49 @@ mod test {
         check_real!(U64, u64);
         check_real!(F32, f32);
         check_real!(F64, f64);
+
+        // Div preserves dtype for floats...
+        macro_rules! check_float_div {
+            ($variant:ident, $t:ty) => {{
+                let a = Tensor::from([6 as $t, 4 as $t]);
+                let b = Tensor::from([3 as $t, 2 as $t]);
+                if let Tensor::$variant(arr) = &a / &b {
+                    if arr.as_slice().unwrap() != [2 as $t, 2 as $t] {
+                        fails.push(format!("{} div: got {arr:?}", stringify!($variant)));
+                    }
+                } else {
+                    fails.push(format!("{} div: wrong variant", stringify!($variant)));
+                }
+            }};
+        }
+        check_float_div!(F32, f32);
+        check_float_div!(F64, f64);
+
+        // ...but promotes integers to F64 (true division).
+        macro_rules! check_int_div {
+            ($t:ty) => {{
+                let a = Tensor::from([6 as $t, 4 as $t]);
+                let b = Tensor::from([3 as $t, 2 as $t]);
+                if let Tensor::F64(arr) = &a / &b {
+                    if arr.as_slice().unwrap() != [2.0f64, 2.0] {
+                        fails.push(format!(
+                            "{} div: got {arr:?}, want F64 [2.0, 2.0]",
+                            stringify!($t)
+                        ));
+                    }
+                } else {
+                    fails.push(format!("{} div: wrong variant, want F64", stringify!($t)));
+                }
+            }};
+        }
+        check_int_div!(i8);
+        check_int_div!(i16);
+        check_int_div!(i32);
+        check_int_div!(i64);
+        check_int_div!(u8);
+        check_int_div!(u16);
+        check_int_div!(u32);
+        check_int_div!(u64);
 
         // Check the same ops, but not Rem, with complex dtypes
         macro_rules! check_complex {
