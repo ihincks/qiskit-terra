@@ -14,6 +14,8 @@ mod data_tree;
 mod input;
 pub mod math_nodes;
 mod program_node;
+#[cfg(feature = "python")]
+pub mod python;
 mod quantum_program;
 mod shot_loop;
 mod store;

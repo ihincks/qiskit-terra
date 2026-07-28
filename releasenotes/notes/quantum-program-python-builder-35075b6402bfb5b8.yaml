@@ -1,0 +1,72 @@
+---
+features_misc:
+  - |
+    Added a new module, :mod:`qiskit.quantum_program`, for ergonomically building a
+    :class:`.QuantumProgram`, a data-flow graph of tensor operations. The module uses a
+    *tracer* front-end: program inputs are declared with :func:`~qiskit.quantum_program.qp_input`,
+    which returns a :class:`.Tracer` supporting the usual arithmetic and bitwise operators
+    (``+ - * / % ** & | ^ ~``), as well as ``mean``, ``var``, ``std``, and ``parity``
+    reductions along an axis. Operator calls assemble a pure-Python expression tree; no graph
+    exists during construction. Each operation is type-checked (dtype and shape) immediately,
+    so mistakes are reported at the offending Python line, and the inferred output
+    :class:`.TensorSpec` of any intermediate is available right away via ``.spec``. The real
+    graph is materialized only when :func:`~qiskit.quantum_program.build` is called on the
+    requested outputs; shared subexpressions collapse to a single node (fan-out) and tracers
+    not reachable from the outputs are dropped (dead-code elimination). For example::
+
+        import numpy as np
+        from qiskit.quantum_program import qp_input, build, f64
+
+        x = qp_input("x", f64[3])
+        y = (x * x).mean(axis=0)   # y.spec == TensorSpec(f64, []) available now
+
+        prog = build({"z": y})     # QuantumProgram materialized here
+        prog.resolve()             # {"z": TensorSpec(f64, [])}
+
+    Circuits can be wired into the program via :func:`~qiskit.quantum_program.shot_loop`, which
+    adds a node that (once a backend supports executing it) runs each circuit for a number of
+    shots, fed by per-circuit parameter values. Since this is a multi-output node, it doesn't
+    return a bespoke container type; instead a :class:`.Tracer` doubles as a *port* -- a node
+    plus a path into that node's output :class:`.DataTree` -- so :func:`~.shot_loop` simply
+    returns a single, structured :class:`.Tracer` shaped like a ``list`` (one entry per circuit)
+    of ``dict``\\ s (one per classical register), indexable and iterable like the containers it
+    represents. The parameters for each circuit may carry an arbitrary-rank leading batch prefix
+    (e.g. shape ``[10, num_parameters]`` or ``[10, 20, 30, num_parameters]``), which is
+    propagated unchanged onto the leading axes of that circuit's output register shapes. Note
+    that this cut only supports *constructing* such a node; executing a :class:`.QuantumProgram`
+    is still out of scope. For example::
+
+        from qiskit.circuit import QuantumCircuit, Parameter
+        from qiskit.quantum_program import qp_input, shot_loop, build
+
+        theta = Parameter("theta")
+        qc = QuantumCircuit(2)
+        qc.ry(theta, 0)
+        qc.ry(theta, 1)
+        qc.measure_all()
+
+        theta_in = qp_input("theta", f64[1])
+        outputs = shot_loop([qc], shots=4000, params=[theta_in])
+        bits = outputs[0]["meas"]  # Tracer(dtype=bit, shape=[4000, 2])
+
+        magnetization = 1 - 2 * bits.parity(axis=1).mean(axis=0)
+        build({"magnetization": magnetization}).resolve()  # {"magnetization": TensorSpec(f64, [])}
+
+    :func:`~qiskit.quantum_program.build` and :meth:`.QuantumProgram.resolve` honor a
+    round-trip contract -- the structure you build with is the structure you get back -- so a
+    :func:`~.shot_loop` result can be passed to :func:`~.build` directly, with no wrapping
+    ``dict`` needed::
+
+        build(outputs).resolve()  # [{"meas": TensorSpec(bit, [4000, 2])}]
+
+    This structure is described by the new :class:`.DataTree`, a leaf-or-branch tree (mirroring
+    the Rust ``DataTree`` used internally) that also underlies the ``outputs`` argument of
+    :func:`~.build` itself, so arbitrarily nested ``list``/``tuple``/``dict``/namedtuple
+    structures of tracers are accepted, not just a single level.
+
+    Every operator and reduction method also has a numpy-style standalone-function
+    counterpart in :mod:`qiskit.quantum_program`, so ``mean(x, axis=0)`` and ``x.mean(axis=0)``
+    (likewise :func:`~.add`/``x + y``, :func:`~.multiply`/``x * y``, :func:`~.bitwise_xor`/
+    ``x ^ y``, and so on for :func:`~.subtract`, :func:`~.divide`, :func:`~.remainder`,
+    :func:`~.power`, :func:`~.bitwise_and`, :func:`~.bitwise_or`, :func:`~.bitwise_not`,
+    :func:`~.var`, :func:`~.std`, and :func:`~.parity`) are interchangeable.

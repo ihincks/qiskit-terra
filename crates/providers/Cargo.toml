@@ -13,6 +13,7 @@ qiskit-circuit.workspace = true
 rustworkx-core.workspace = true
 num-complex.workspace = true
 thiserror.workspace = true
+numpy = { workspace = true, optional = true }
 
 [dependencies.approx]
 workspace = true
@@ -22,9 +23,17 @@ features = ["num-complex"]
 workspace = true
 features = ["rayon", "serde"]
 
-[lints]
-workspace = true
-
 [dependencies.ndarray]
 workspace = true
 features = ["rayon", "approx"]
+
+[dependencies.pyo3]
+workspace = true
+optional = true
+features = ["hashbrown", "num-complex"]
+
+[lints]
+workspace = true
+
+[features]
+python = ["dep:pyo3", "dep:numpy"]
