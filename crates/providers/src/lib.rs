@@ -11,6 +11,7 @@
 // that they have been altered from the originals.
 
 mod data_tree;
+mod input;
 pub mod math_nodes;
 mod program_node;
 mod quantum_program;
@@ -19,6 +20,7 @@ mod store;
 pub mod tensor;
 
 pub use data_tree::{ArityMismatch, DataTree, PathEntry, TreeMatchError};
+pub use input::Input;
 pub use program_node::{CallError, CallInputError, MissingCallError, ProgramNode, ProgramNodeExt};
 pub use quantum_program::{
     BoxedNodeError, OwnedPath, OwnedPathEntry, Port, QuantumProgram, QuantumProgramCallError,

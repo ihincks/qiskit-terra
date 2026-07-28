@@ -11,6 +11,7 @@
 // that they have been altered from the originals.
 
 use crate::data_tree::{DataTree, PathEntry};
+use crate::input::Input;
 use crate::program_node::ProgramNode;
 use crate::tensor::{Tensor, TensorType};
 use hashbrown::HashMap;
@@ -430,6 +431,14 @@ pub struct QuantumProgram {
     label_to_node: HashMap<String, NodeIndex>,
     occupied_input_ports: HashMap<NodeIndex, Vec<bool>>,
     inputs: Vec<(String, NodeIndex, LeafIdx)>,
+    /// Program inputs declared via [`Self::add_input`]: each is backed by a dedicated
+    /// [`Input`] source node (rather than binding directly to one consumer's input
+    /// port like `inputs` does), so its single output can fan out to any number of
+    /// consumer ports through the ordinary edge-based fan-out path. Positioned after
+    /// `inputs` in the canonical leaf order of `input_types()` (see
+    /// [`Self::collect_declared_types`]/[`Self::rebuild_io_types`]) and in
+    /// [`Self::run_topo`]'s program-input injection.
+    input_source_nodes: Vec<(String, NodeIndex)>,
     outputs: Vec<(String, NodeIndex, LeafIdx)>,
     input_types: DataTree<TensorType>,
     output_types: DataTree<TensorType>,
@@ -449,6 +458,7 @@ impl QuantumProgram {
             label_to_node: HashMap::new(),
             occupied_input_ports: HashMap::new(),
             inputs: Vec::new(),
+            input_source_nodes: Vec::new(),
             outputs: Vec::new(),
             input_types: DataTree::new(),
             output_types: DataTree::new(),
@@ -535,6 +545,28 @@ impl QuantumProgram {
         self.inputs.push((key.to_string(), idx, leaf));
         self.rebuild_io_types();
         Ok(())
+    }
+
+    /// Declare a program input under `key`, backed by a dedicated [`Input`] source
+    /// node with the given declared type.
+    ///
+    /// Unlike [`Self::set_input`] (which binds a program input directly to one
+    /// specific consumer's input port), the returned [`Port`] is a node *output*
+    /// port. Wire it via [`Self::add_edge`] like any other node output — including
+    /// to more than one consumer, which lets a single program input fan out (e.g. for
+    /// building `x * x`).
+    pub fn add_input(&mut self, key: &str, spec: TensorType) -> Result<Port, QuantumProgramError> {
+        if self.inputs.iter().any(|(k, _, _)| k == key)
+            || self.input_source_nodes.iter().any(|(k, _)| k == key)
+        {
+            return Err(QuantumProgramError::DuplicateIOKey(key.to_string()));
+        }
+        let label = format!("__input_{key}");
+        self.add_node(label.clone(), Input::new(spec))?;
+        let idx = self.label_to_node[&label];
+        self.input_source_nodes.push((key.to_string(), idx));
+        self.rebuild_io_types();
+        Ok(Port::new(label, vec![]))
     }
 
     /// Declare an output port of this program under `key`. Multiple outputs
@@ -636,8 +668,19 @@ impl QuantumProgram {
     }
 
     /// Rebuild `input_types` and `output_types` from declared I/O.
+    ///
+    /// `input_types` lists all [`Self::set_input`]-declared leaves first, then all
+    /// [`Self::add_input`]-declared leaves — this canonical order must match the
+    /// program-input injection order used by [`Self::run_topo`].
     fn rebuild_io_types(&mut self) {
-        self.input_types = self.collect_declared_types(&self.inputs, PortSide::Input);
+        let mut input_types = self.collect_declared_types(&self.inputs, PortSide::Input);
+        for (key, idx) in &self.input_source_nodes {
+            // `Input` nodes always have exactly one output leaf, at the root path.
+            if let DataTree::Leaf(tt) = self.graph[*idx].types(PortSide::Output) {
+                input_types.insert_leaf(key, tt.clone());
+            }
+        }
+        self.input_types = input_types;
         self.output_types = self.collect_declared_types(&self.outputs, PortSide::Output);
     }
 
@@ -808,6 +851,26 @@ impl QuantumProgram {
 
         // The consumer table is mutated (drained) as we go, so work on a local copy.
         let mut consumers = plan.consumers.clone();
+
+        // Inject program inputs declared via `add_input`: each is backed by a dedicated
+        // `Input` source node, so — unlike the direct-to-consumer-port seeding above —
+        // its value is dispatched to that node's own output consumers, draining its
+        // consumer-table row up front so the main loop below skips calling the (call-less)
+        // `Input` node itself.
+        for (i, (key, node_idx)) in self.input_source_nodes.iter().enumerate() {
+            let value = program_inputs
+                .get(self.inputs.len() + i)
+                .cloned()
+                .ok_or_else(|| QuantumProgramCallError::MissingProgramInput { key: key.clone() })?;
+            let topo_idx = plan.node_idx_to_topo_idx[node_idx.index()].unwrap();
+            let node_consumers = std::mem::take(&mut consumers[topo_idx]);
+            dispatch_all(
+                &node_consumers,
+                vec![value],
+                &mut input_buffer,
+                &mut output_values,
+            );
+        }
 
         // Finally, we can loop through each node and call it.
         for (topo_idx, &node_idx) in plan.topo_order.iter().enumerate() {
@@ -1317,5 +1380,155 @@ mod tests {
         assert_eq!(resolved.len(), 1);
         assert!(matches!(resolved[0].dtype, DTypeLike::Concrete(DType::F64)));
         assert_eq!(resolved[0].shape, vec![Dim::Fixed(1)]);
+    }
+
+    // -----------------------------------------------------------------------
+    // add_input
+    // -----------------------------------------------------------------------
+
+    fn concrete_1d(len: usize) -> TensorType {
+        TensorType {
+            dtype: DTypeLike::Concrete(DType::F64),
+            shape: vec![Dim::Fixed(len)],
+            broadcastable: true,
+        }
+    }
+
+    #[test]
+    fn test_add_input_fanout_call_flat() {
+        // x -> Add(x, x): a single `add_input`-declared value fans out to both
+        // operands of one node, via ordinary edges from the `Input` node's output.
+        use crate::math_nodes::Add;
+        let mut prog = QuantumProgram::new();
+        prog.add_node("add", Add).unwrap();
+        let x_port = prog.add_input("x", concrete_1d(3)).unwrap();
+        prog.add_edge(x_port.clone(), Port::new("add", vec!["x".into()]))
+            .unwrap();
+        prog.add_edge(x_port, Port::new("add", vec!["y".into()]))
+            .unwrap();
+        prog.set_output("result", Port::new("add", vec![])).unwrap();
+
+        let out = prog
+            .call_flat(&[Tensor::from([1.0_f64, 2.0, 3.0])])
+            .unwrap();
+        let Tensor::F64(arr) = &out[0] else {
+            panic!("expected f64 leaf");
+        };
+        assert_eq!(arr.as_slice().unwrap(), &[2.0, 4.0, 6.0]);
+    }
+
+    #[test]
+    fn test_add_input_fanout_resolve_types_flat() {
+        use crate::math_nodes::Add;
+        let mut prog = QuantumProgram::new();
+        prog.add_node("add", Add).unwrap();
+        let x_port = prog.add_input("x", concrete_1d(3)).unwrap();
+        prog.add_edge(x_port.clone(), Port::new("add", vec!["x".into()]))
+            .unwrap();
+        prog.add_edge(x_port, Port::new("add", vec!["y".into()]))
+            .unwrap();
+        prog.set_output("result", Port::new("add", vec![])).unwrap();
+
+        let resolved = prog.resolve_types_flat(&[concrete_1d(3)]).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert!(matches!(resolved[0].dtype, DTypeLike::Concrete(DType::F64)));
+        assert_eq!(resolved[0].shape, vec![Dim::Fixed(3)]);
+    }
+
+    #[test]
+    fn test_add_input_into_nested_program() {
+        // Outer program's `add_input`-declared input feeds an inner nested
+        // `QuantumProgram` node's `set_input`-declared input.
+        use crate::math_nodes::Add;
+        let mut inner = QuantumProgram::new();
+        inner.add_node("s", make_store(1.0)).unwrap();
+        inner.add_node("add", Add).unwrap();
+        inner
+            .add_edge(Port::new("s", vec![]), Port::new("add", vec!["x".into()]))
+            .unwrap();
+        inner
+            .set_input("y", Port::new("add", vec!["y".into()]))
+            .unwrap();
+        inner.set_output("sum", Port::new("add", vec![])).unwrap();
+
+        let mut outer = QuantumProgram::new();
+        outer.add_node("inner", inner).unwrap();
+        let y_port = outer.add_input("y", concrete_1d(1)).unwrap();
+        outer
+            .add_edge(y_port, Port::new("inner", vec!["y".into()]))
+            .unwrap();
+        outer
+            .set_output("result", Port::new("inner", vec!["sum".into()]))
+            .unwrap();
+
+        let out = outer.call_flat(&[Tensor::from([4.0_f64])]).unwrap();
+        let Tensor::F64(arr) = &out[0] else {
+            panic!("expected f64 leaf");
+        };
+        assert_eq!(arr.as_slice().unwrap(), &[5.0_f64]);
+    }
+
+    #[test]
+    fn test_add_input_duplicate_key_errors() {
+        let mut prog = QuantumProgram::new();
+        prog.add_input("x", concrete_1d(1)).unwrap();
+        let err = prog.add_input("x", concrete_1d(1)).unwrap_err();
+        assert!(matches!(err, QuantumProgramError::DuplicateIOKey(ref k) if k == "x"));
+    }
+
+    #[test]
+    fn test_add_input_duplicate_key_across_set_input_errors() {
+        let mut prog = QuantumProgram::new();
+        prog.add_node("op", BinaryTestNode).unwrap();
+        prog.set_input("x", Port::new("op", vec!["x".into()]))
+            .unwrap();
+        let err = prog.add_input("x", concrete_1d(1)).unwrap_err();
+        assert!(matches!(err, QuantumProgramError::DuplicateIOKey(ref k) if k == "x"));
+    }
+
+    #[test]
+    fn test_input_types_canonical_order_set_input_then_add_input() {
+        let mut prog = QuantumProgram::new();
+        prog.add_node("op", BinaryTestNode).unwrap();
+        prog.set_input("a", Port::new("op", vec!["x".into()]))
+            .unwrap();
+        prog.add_input("b", concrete_1d(2)).unwrap();
+
+        let order: Vec<&str> = prog
+            .input_types()
+            .iter_children()
+            .map(|(k, _)| k.unwrap())
+            .collect();
+        assert_eq!(order, ["a", "b"]);
+    }
+
+    #[test]
+    fn test_resolve_types_flat_permits_symbolic_program_input() {
+        // A program input whose shape isn't yet concrete (`Dim::Named`) still resolves
+        // permissively against a concrete `Store` shape: no false-positive error, and
+        // per `broadcast_dims`, the concrete side wins.
+        use crate::math_nodes::Add;
+        let mut prog = QuantumProgram::new();
+        prog.add_node(
+            "s",
+            Store::new(DataTree::new_leaf(Tensor::from([1.0_f64, 2.0, 3.0]))),
+        )
+        .unwrap();
+        prog.add_node("add", Add).unwrap();
+        prog.add_edge(Port::new("s", vec![]), Port::new("add", vec!["x".into()]))
+            .unwrap();
+        prog.set_input("y", Port::new("add", vec!["y".into()]))
+            .unwrap();
+        prog.set_output("result", Port::new("add", vec![])).unwrap();
+
+        let resolved = prog
+            .resolve_types_flat(&[TensorType {
+                dtype: DTypeLike::Concrete(DType::F64),
+                shape: vec![Dim::Named("n".into())],
+                broadcastable: true,
+            }])
+            .unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].shape, vec![Dim::Fixed(3)]);
     }
 }
