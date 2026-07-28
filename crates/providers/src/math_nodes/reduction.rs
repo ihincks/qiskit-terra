@@ -36,6 +36,44 @@ static OUTPUT_TYPES: LazyLock<DataTree<TensorType>> = LazyLock::new(|| {
     })
 });
 
+/// Resolve the output dtype for [`Mean`]: `F32` stays `F32`, `C64`/`C128` stay complex,
+/// and everything else (integers, `Bit`, other floats) casts to `F64`, mirroring
+/// [`Mean::call_flat`]. Symbolic (unresolved) dtypes are passed through as-is.
+fn mean_out_dtype(dtype: &DTypeLike) -> DTypeLike {
+    match dtype {
+        DTypeLike::Concrete(DType::F32) => DTypeLike::Concrete(DType::F32),
+        DTypeLike::Concrete(DType::C64) => DTypeLike::Concrete(DType::C64),
+        DTypeLike::Concrete(DType::C128) => DTypeLike::Concrete(DType::C128),
+        DTypeLike::Concrete(_) => DTypeLike::Concrete(DType::F64),
+        other => other.clone(),
+    }
+}
+
+/// Resolve the output dtype for [`Variance`]/[`Std`]: like [`mean_out_dtype`], except
+/// complex inputs produce their real counterpart (`C64` -> `F32`, `C128` -> `F64`)
+/// rather than staying complex, mirroring [`Variance::call_flat`]/[`Std::call_flat`].
+/// Symbolic (unresolved) dtypes are passed through as-is.
+fn real_out_dtype(dtype: &DTypeLike) -> DTypeLike {
+    match dtype {
+        DTypeLike::Concrete(DType::F32) => DTypeLike::Concrete(DType::F32),
+        DTypeLike::Concrete(DType::C64) => DTypeLike::Concrete(DType::F32),
+        DTypeLike::Concrete(DType::C128) => DTypeLike::Concrete(DType::F64),
+        DTypeLike::Concrete(_) => DTypeLike::Concrete(DType::F64),
+        other => other.clone(),
+    }
+}
+
+/// Remove `axis` from a resolved shape, bounds-checked against its rank.
+fn reduced_shape(
+    axis: usize,
+    shape: &[crate::tensor::Dim],
+) -> Result<Vec<crate::tensor::Dim>, super::MathNodeError> {
+    super::check_axis(axis, shape.len())?;
+    let mut shape = shape.to_vec();
+    shape.remove(axis);
+    Ok(shape)
+}
+
 /// Mean of a tensor along a specified axis, removing that axis.
 ///
 /// Integer inputs are cast to `F64` before computing the mean. `F32` inputs
@@ -92,6 +130,17 @@ impl ProgramNode for Mean {
             }
         };
         Ok(vec![result])
+    }
+    fn resolve_types_flat(
+        &self,
+        input_types: &[TensorType],
+    ) -> Result<Vec<TensorType>, Self::CallError> {
+        unpack_tensor_args!(input_types, [x]);
+        Ok(vec![TensorType {
+            dtype: mean_out_dtype(&x.dtype),
+            shape: reduced_shape(self.axis, &x.shape)?,
+            broadcastable: x.broadcastable,
+        }])
     }
 }
 
@@ -168,6 +217,17 @@ impl ProgramNode for Variance {
         };
         Ok(vec![result])
     }
+    fn resolve_types_flat(
+        &self,
+        input_types: &[TensorType],
+    ) -> Result<Vec<TensorType>, Self::CallError> {
+        unpack_tensor_args!(input_types, [x]);
+        Ok(vec![TensorType {
+            dtype: real_out_dtype(&x.dtype),
+            shape: reduced_shape(self.axis, &x.shape)?,
+            broadcastable: x.broadcastable,
+        }])
+    }
 }
 
 /// Standard deviation of a tensor along a specified axis, removing that axis.
@@ -243,6 +303,17 @@ impl ProgramNode for Std {
             }
         };
         Ok(vec![result])
+    }
+    fn resolve_types_flat(
+        &self,
+        input_types: &[TensorType],
+    ) -> Result<Vec<TensorType>, Self::CallError> {
+        unpack_tensor_args!(input_types, [x]);
+        Ok(vec![TensorType {
+            dtype: real_out_dtype(&x.dtype),
+            shape: reduced_shape(self.axis, &x.shape)?,
+            broadcastable: x.broadcastable,
+        }])
     }
 }
 
@@ -360,7 +431,9 @@ mod tests {
     fn test_std_matches_sqrt_of_variance() {
         // Verify std = sqrt(variance) numerically
         let x = Tensor::from([1.0_f64, 3.0, 5.0, 7.0, 9.0]);
-        let var_result = Variance::new(0, 0.0).call_flat(std::slice::from_ref(&x)).unwrap();
+        let var_result = Variance::new(0, 0.0)
+            .call_flat(std::slice::from_ref(&x))
+            .unwrap();
         let std_result = Std::new(0, 0.0).call_flat(&[x]).unwrap();
 
         let Tensor::F64(var_arr) = &var_result[0] else {
@@ -447,5 +520,119 @@ mod tests {
         let x = Tensor::from([1.0_f64, 2.0, 3.0]);
         let err = Std::new(1, 0.0).call_flat(&[x]).unwrap_err();
         assert_eq!(err, MathNodeError::InvalidAxis { axis: 1, ndim: 1 });
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_types_flat
+    // -----------------------------------------------------------------------
+
+    use crate::tensor::Dim;
+
+    fn concrete(dtype: DType, shape: Vec<Dim>) -> TensorType {
+        TensorType {
+            dtype: DTypeLike::Concrete(dtype),
+            shape,
+            broadcastable: true,
+        }
+    }
+
+    #[test]
+    fn test_mean_resolve_types_flat_matches_call_flat_f64() {
+        let x = Tensor::F64(
+            arr2(&[[1.0_f64, 2.0, 3.0], [4.0, 5.0, 6.0]])
+                .into_dyn()
+                .into_shared(),
+        );
+        let called = Mean::new(0).call_flat(&[x]).unwrap();
+        let resolved = Mean::new(0)
+            .resolve_types_flat(&[concrete(DType::F64, vec![Dim::Fixed(2), Dim::Fixed(3)])])
+            .unwrap();
+        assert!(matches!(resolved[0].dtype, DTypeLike::Concrete(DType::F64)));
+        assert_eq!(resolved[0].shape, vec![Dim::Fixed(3)]);
+        assert_eq!(called[0].dtype(), DType::F64);
+        assert_eq!(called[0].shape(), &[3]);
+    }
+
+    #[test]
+    fn test_mean_resolve_types_flat_preserves_c128() {
+        let resolved = Mean::new(0)
+            .resolve_types_flat(&[concrete(DType::C128, vec![Dim::Fixed(3)])])
+            .unwrap();
+        assert!(matches!(
+            resolved[0].dtype,
+            DTypeLike::Concrete(DType::C128)
+        ));
+    }
+
+    #[test]
+    fn test_mean_resolve_types_flat_casts_integer_to_f64() {
+        let called = Mean::new(0)
+            .call_flat(&[Tensor::from([1_i32, 2, 3, 4])])
+            .unwrap();
+        let resolved = Mean::new(0)
+            .resolve_types_flat(&[concrete(DType::I32, vec![Dim::Fixed(4)])])
+            .unwrap();
+        assert!(matches!(resolved[0].dtype, DTypeLike::Concrete(DType::F64)));
+        assert_eq!(called[0].dtype(), DType::F64);
+    }
+
+    #[test]
+    fn test_mean_resolve_types_flat_propagates_unresolved_dtype() {
+        let resolved = Mean::new(0)
+            .resolve_types_flat(&[TensorType {
+                dtype: DTypeLike::Var("x".into()),
+                shape: vec![Dim::Fixed(3)],
+                broadcastable: true,
+            }])
+            .unwrap();
+        assert!(matches!(resolved[0].dtype, DTypeLike::Var(_)));
+        assert_eq!(resolved[0].shape, Vec::<Dim>::new());
+    }
+
+    #[test]
+    fn test_mean_resolve_types_flat_axis_out_of_bounds_errors() {
+        let err = Mean::new(1)
+            .resolve_types_flat(&[concrete(DType::F64, vec![Dim::Fixed(3)])])
+            .unwrap_err();
+        assert_eq!(err, MathNodeError::InvalidAxis { axis: 1, ndim: 1 });
+    }
+
+    #[test]
+    fn test_variance_resolve_types_flat_matches_call_flat() {
+        let x = Tensor::from([2.0_f64, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]);
+        let called = Variance::new(0, 0.0).call_flat(&[x]).unwrap();
+        let resolved = Variance::new(0, 0.0)
+            .resolve_types_flat(&[concrete(DType::F64, vec![Dim::Fixed(8)])])
+            .unwrap();
+        assert!(matches!(resolved[0].dtype, DTypeLike::Concrete(DType::F64)));
+        assert_eq!(resolved[0].shape, Vec::<Dim>::new());
+        assert_eq!(called[0].dtype(), DType::F64);
+    }
+
+    #[test]
+    fn test_variance_resolve_types_flat_c128_returns_f64() {
+        let resolved = Variance::new(0, 0.0)
+            .resolve_types_flat(&[concrete(DType::C128, vec![Dim::Fixed(2)])])
+            .unwrap();
+        assert!(matches!(resolved[0].dtype, DTypeLike::Concrete(DType::F64)));
+    }
+
+    #[test]
+    fn test_std_resolve_types_flat_matches_call_flat() {
+        let x = Tensor::from([1.0_f64, 3.0, 5.0, 7.0, 9.0]);
+        let called = Std::new(0, 0.0).call_flat(&[x]).unwrap();
+        let resolved = Std::new(0, 0.0)
+            .resolve_types_flat(&[concrete(DType::F64, vec![Dim::Fixed(5)])])
+            .unwrap();
+        assert!(matches!(resolved[0].dtype, DTypeLike::Concrete(DType::F64)));
+        assert_eq!(called[0].dtype(), DType::F64);
+    }
+
+    #[test]
+    fn test_std_resolve_types_flat_c64_returns_f32() {
+        let resolved = Std::new(0, 0.0)
+            .resolve_types_flat(&[concrete(DType::C64, vec![Dim::Fixed(2)])])
+            .unwrap();
+        assert!(matches!(resolved[0].dtype, DTypeLike::Concrete(DType::F32)));
     }
 }

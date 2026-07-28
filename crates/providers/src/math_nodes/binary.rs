@@ -12,7 +12,7 @@
 
 use crate::data_tree::DataTree;
 use crate::program_node::ProgramNode;
-use crate::tensor::{DTypeLike, Tensor, TensorType, promotion};
+use crate::tensor::{DTypeLike, Tensor, TensorType, broadcast_dims, promotion};
 use crate::unpack_tensor_args;
 use std::sync::LazyLock;
 
@@ -79,6 +79,24 @@ macro_rules! elementwise_binary_node {
                 let x = x.clone().cast(out_dtype);
                 let y = y.clone().cast(out_dtype);
                 Ok(vec![$call_fn(&x, &y)?])
+            }
+            fn resolve_types_flat(
+                &self,
+                input_types: &[TensorType],
+            ) -> Result<Vec<TensorType>, Self::CallError> {
+                unpack_tensor_args!(input_types, [x, y]);
+                let shape = broadcast_dims(&x.shape, &y.shape)?;
+                let dtype = match (&x.dtype, &y.dtype) {
+                    (DTypeLike::Concrete(dx), DTypeLike::Concrete(dy)) => {
+                        DTypeLike::Concrete(promotion(*dx, *dy))
+                    }
+                    _ => DTypeLike::Promotion(vec![x.dtype.clone(), y.dtype.clone()].into()),
+                };
+                Ok(vec![TensorType {
+                    dtype,
+                    shape,
+                    broadcastable: true,
+                }])
             }
         }
     };
@@ -258,6 +276,106 @@ mod tests {
     #[test]
     fn test_add_wrong_arity_errors() {
         let err = Add.call_flat(&[Tensor::from([1.0_f64])]).unwrap_err();
+        assert_eq!(
+            err,
+            MathNodeError::Input(CallInputError::WrongArity {
+                expected: 2,
+                actual: 1,
+            })
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_types_flat
+    // -----------------------------------------------------------------------
+
+    use crate::tensor::{DTypeLike, Dim};
+
+    fn concrete(dtype: DType, shape: Vec<Dim>) -> TensorType {
+        TensorType {
+            dtype: DTypeLike::Concrete(dtype),
+            shape,
+            broadcastable: true,
+        }
+    }
+
+    #[test]
+    fn test_resolve_types_flat_matches_call_flat_same_dtype() {
+        // [2,3] F64 + [3] F64: call_flat produces shape [2,3], dtype F64.
+        let x = Tensor::F64(
+            ndarray::arr2(&[[1.0_f64, 2.0, 3.0], [4.0, 5.0, 6.0]])
+                .into_dyn()
+                .into_shared(),
+        );
+        let y = Tensor::from([10.0_f64, 20.0, 30.0]);
+        let called = Add.call_flat(&[x, y]).unwrap();
+
+        let resolved = Add
+            .resolve_types_flat(&[
+                concrete(DType::F64, vec![Dim::Fixed(2), Dim::Fixed(3)]),
+                concrete(DType::F64, vec![Dim::Fixed(3)]),
+            ])
+            .unwrap();
+
+        assert_eq!(resolved.len(), 1);
+        assert!(matches!(resolved[0].dtype, DTypeLike::Concrete(DType::F64)));
+        assert_eq!(resolved[0].shape, vec![Dim::Fixed(2), Dim::Fixed(3)]);
+        assert_eq!(called[0].dtype(), DType::F64);
+        assert_eq!(called[0].shape(), &[2, 3]);
+    }
+
+    #[test]
+    fn test_resolve_types_flat_promotes_dtype_like_call_flat() {
+        // F32 + F64 promotes to F64, matching call_flat's promotion rule.
+        let called = Add
+            .call_flat(&[Tensor::from([1.0_f32, 2.0]), Tensor::from([3.0_f64, 4.0])])
+            .unwrap();
+
+        let resolved = Add
+            .resolve_types_flat(&[
+                concrete(DType::F32, vec![Dim::Fixed(2)]),
+                concrete(DType::F64, vec![Dim::Fixed(2)]),
+            ])
+            .unwrap();
+
+        assert!(matches!(resolved[0].dtype, DTypeLike::Concrete(DType::F64)));
+        assert_eq!(called[0].dtype(), DType::F64);
+    }
+
+    #[test]
+    fn test_resolve_types_flat_incompatible_shapes_errors() {
+        let err = Add
+            .resolve_types_flat(&[
+                concrete(DType::F64, vec![Dim::Fixed(3)]),
+                concrete(DType::F64, vec![Dim::Fixed(4)]),
+            ])
+            .unwrap_err();
+        assert!(matches!(err, MathNodeError::Tensor(_)));
+    }
+
+    #[test]
+    fn test_resolve_types_flat_propagates_unresolved_dtype() {
+        // If either operand dtype is unresolved (Var/Promotion), the output
+        // dtype stays an unresolved Promotion rather than a false Concrete guess.
+        let resolved = Add
+            .resolve_types_flat(&[
+                TensorType {
+                    dtype: DTypeLike::Var("x".into()),
+                    shape: vec![Dim::Fixed(3)],
+                    broadcastable: true,
+                },
+                concrete(DType::F64, vec![Dim::Fixed(3)]),
+            ])
+            .unwrap();
+        assert!(matches!(resolved[0].dtype, DTypeLike::Promotion(_)));
+        assert_eq!(resolved[0].shape, vec![Dim::Fixed(3)]);
+    }
+
+    #[test]
+    fn test_resolve_types_flat_wrong_arity_errors() {
+        let err = Add
+            .resolve_types_flat(&[concrete(DType::F64, vec![])])
+            .unwrap_err();
         assert_eq!(
             err,
             MathNodeError::Input(CallInputError::WrongArity {

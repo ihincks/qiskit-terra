@@ -275,6 +275,14 @@ pub enum QuantumProgramCallError {
     /// program input — execution can't supply a value for it.
     #[error("node {label:?} has an unwired input at {}", format_path(path))]
     UnwiredInput { label: String, path: OwnedPath },
+
+    /// An inner node returned an error from its `resolve_types_flat` implementation.
+    #[error("resolving types for node {label:?}")]
+    NodeTypeResolution {
+        label: String,
+        #[source]
+        source: BoxedNodeError,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -351,6 +359,14 @@ impl DynNode {
                     .call_flat(args)
                     .map_err(|e| Box::new(e) as BoxedNodeError)
             }
+            fn resolve_types_flat(
+                &self,
+                input_types: &[TensorType],
+            ) -> Result<Vec<TensorType>, BoxedNodeError> {
+                self.0
+                    .resolve_types_flat(input_types)
+                    .map_err(|e| Box::new(e) as BoxedNodeError)
+            }
         }
         DynNode(Box::new(Adapter(node)))
     }
@@ -376,11 +392,18 @@ impl ProgramNode for DynNode {
     fn call_flat(&self, args: &[Tensor]) -> Result<Vec<Tensor>, BoxedNodeError> {
         self.0.call_flat(args)
     }
+    fn resolve_types_flat(
+        &self,
+        input_types: &[TensorType],
+    ) -> Result<Vec<TensorType>, BoxedNodeError> {
+        self.0.resolve_types_flat(input_types)
+    }
 }
 
 /// Where a leaf coming out of a node should be sent. Indices are local to a
 /// single `call_flat` invocation: `target_topo_idx` is the position in the
 /// topological order; `output_idx` is the position in `self.outputs`.
+#[derive(Clone, Copy)]
 enum ConsumerKind {
     Edge {
         target_topo_idx: usize,
@@ -663,10 +686,51 @@ impl ProgramNode for QuantumProgram {
     }
 
     fn call_flat(&self, args: &[Tensor]) -> Result<Vec<Tensor>, QuantumProgramCallError> {
+        let plan = self.topo_plan()?;
+        self.run_topo(
+            &plan,
+            args,
+            |node, flat_args| node.call_flat(flat_args),
+            |label, source| QuantumProgramCallError::NodeCall { label, source },
+        )
+    }
+
+    fn resolve_types_flat(
+        &self,
+        input_types: &[TensorType],
+    ) -> Result<Vec<TensorType>, QuantumProgramCallError> {
+        let plan = self.topo_plan()?;
+        self.run_topo(
+            &plan,
+            input_types,
+            |node, flat_types| node.resolve_types_flat(flat_types),
+            |label, source| QuantumProgramCallError::NodeTypeResolution { label, source },
+        )
+    }
+}
+
+/// The data-independent part of a [`QuantumProgram`] execution/resolution plan: a
+/// topological node order plus the per-node-output consumer table. Computed once by
+/// [`QuantumProgram::topo_plan`] and reused by [`QuantumProgram::run_topo`] for both
+/// [`ProgramNode::call_flat`] (over [`Tensor`]) and [`ProgramNode::resolve_types_flat`]
+/// (over [`TensorType`]), since neither pass depends on which kind of data is flowing.
+struct TopoPlan {
+    /// The topological ordering, which determines call order and doubles as our local
+    /// dense indexing: each node's position in `topo_order` is its `topo_idx`.
+    topo_order: Vec<NodeIndex>,
+    /// Map from `NodeIndex` → `topo_idx`, formatted as a list to avoid using a hash map.
+    node_idx_to_topo_idx: Vec<Option<usize>>,
+    /// Per-node consumer table: for example, `consumers[topo_idx][2]` is the list of
+    /// where the 2nd output of the node corresponding to topo_idx should be sent.
+    consumers: Vec<Vec<Vec<ConsumerKind>>>,
+}
+
+impl QuantumProgram {
+    /// Compute the topological order and consumer table shared by [`Self::call_flat`]
+    /// and [`Self::resolve_types_flat`].
+    fn topo_plan(&self) -> Result<TopoPlan, QuantumProgramCallError> {
         use rustworkx_core::petgraph::visit::{EdgeRef, NodeIndexable};
 
-        // The topological ordering, which determines call order, doubles as our local
-        // dense indexing: each node's position in `topo_order` is its `topo_idx`.
         let topo_order: Vec<NodeIndex> = lexicographical_topological_sort(
             &self.graph,
             |n: NodeIndex| Ok::<usize, std::convert::Infallible>(n.index()),
@@ -675,14 +739,11 @@ impl ProgramNode for QuantumProgram {
         )
         .map_err(|_| QuantumProgramCallError::Cycle)?;
 
-        // Map from NodeIndex → topo_idx, formatted as a list to avoid using a hash map.
         let mut node_idx_to_topo_idx: Vec<Option<usize>> = vec![None; self.graph.node_bound()];
         for (topo_idx, &node_idx) in topo_order.iter().enumerate() {
             node_idx_to_topo_idx[node_idx.index()] = Some(topo_idx);
         }
 
-        // Per-node consumer table: for example, `consumers[topo_idx][2]` is the list of
-        // where the 2nd output of the node corresponding to topo_idx should be sent.
         let mut consumers: Vec<Vec<Vec<ConsumerKind>>> = topo_order
             .iter()
             .map(|&idx| {
@@ -704,28 +765,52 @@ impl ProgramNode for QuantumProgram {
             consumers[src_topo][*source_leaf].push(ConsumerKind::ProgramOutput { output_idx });
         }
 
-        // Per-node input slot buffer: filled as nodes produce outputs, emptied as they are consumed.
-        // This buffer is initially populated with the inputs to this quantum program itself.
-        // The indexing goes as `input_buffer[topo_idx][input_slot_idx]`.
-        let mut input_buffer: Vec<Vec<Option<Tensor>>> = topo_order
+        Ok(TopoPlan {
+            topo_order,
+            node_idx_to_topo_idx,
+            consumers,
+        })
+    }
+
+    /// Walk `plan`'s topological order, feeding each node's inputs from either
+    /// `program_inputs` or upstream outputs, dispatching outputs to their consumers via
+    /// `plan.consumers`, and finally collecting the program's declared outputs.
+    ///
+    /// Generic over the kind of data flowing through the graph (`Tensor` for
+    /// [`Self::call_flat`], `TensorType` for [`Self::resolve_types_flat`]); `call_node`
+    /// performs the per-node action and `wrap_call_error` labels a failure from it.
+    fn run_topo<T: Clone>(
+        &self,
+        plan: &TopoPlan,
+        program_inputs: &[T],
+        mut call_node: impl FnMut(&DynNode, &[T]) -> Result<Vec<T>, BoxedNodeError>,
+        wrap_call_error: impl Fn(String, BoxedNodeError) -> QuantumProgramCallError,
+    ) -> Result<Vec<T>, QuantumProgramCallError> {
+        // Per-node input slot buffer: filled as nodes produce outputs, emptied as they are
+        // consumed. This buffer is initially populated with the inputs to this quantum
+        // program itself. The indexing goes as `input_buffer[topo_idx][input_slot_idx]`.
+        let mut input_buffer: Vec<Vec<Option<T>>> = plan
+            .topo_order
             .iter()
             .map(|&idx| vec![None; self.graph[idx].input_leaf_paths.len()])
             .collect();
         for (i, (key, target_idx, target_leaf)) in self.inputs.iter().enumerate() {
-            let tensor = args
+            let value = program_inputs
                 .get(i)
                 .cloned()
                 .ok_or_else(|| QuantumProgramCallError::MissingProgramInput { key: key.clone() })?;
-            let target_topo = node_idx_to_topo_idx[target_idx.index()].unwrap();
-            input_buffer[target_topo][*target_leaf] = Some(tensor);
+            let target_topo = plan.node_idx_to_topo_idx[target_idx.index()].unwrap();
+            input_buffer[target_topo][*target_leaf] = Some(value);
         }
 
         // Final program outputs, indexed by position in `self.outputs`.
-        let mut output_tensors: Vec<Option<Tensor>> =
-            (0..self.outputs.len()).map(|_| None).collect();
+        let mut output_values: Vec<Option<T>> = (0..self.outputs.len()).map(|_| None).collect();
+
+        // The consumer table is mutated (drained) as we go, so work on a local copy.
+        let mut consumers = plan.consumers.clone();
 
         // Finally, we can loop through each node and call it.
-        for (topo_idx, &node_idx) in topo_order.iter().enumerate() {
+        for (topo_idx, &node_idx) in plan.topo_order.iter().enumerate() {
             let node_consumers = std::mem::take(&mut consumers[topo_idx]);
             if node_consumers.iter().all(|c| c.is_empty()) {
                 // This node's output has no consumers, we might as well not call it.
@@ -745,7 +830,7 @@ impl ProgramNode for QuantumProgram {
             // means a port was neither wired by an edge nor declared as a
             // program input — surface that as an error rather than panicking.
             let buf = std::mem::take(&mut input_buffer[topo_idx]);
-            let flat_args: Vec<Tensor> = buf
+            let flat_args: Vec<T> = buf
                 .into_iter()
                 .enumerate()
                 .map(|(leaf_idx, slot)| {
@@ -756,12 +841,8 @@ impl ProgramNode for QuantumProgram {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
 
-            let outputs = view.node.call_flat(&flat_args).map_err(|source| {
-                QuantumProgramCallError::NodeCall {
-                    label: label_for(),
-                    source,
-                }
-            })?;
+            let outputs = call_node(&view.node, &flat_args)
+                .map_err(|source| wrap_call_error(label_for(), source))?;
 
             if outputs.len() != view.output_leaf_paths.len() {
                 return Err(QuantumProgramCallError::NodeOutputArityMismatch {
@@ -771,19 +852,12 @@ impl ProgramNode for QuantumProgram {
                 });
             }
 
-            // Clone for all consumers but the last; move into the last.
-            for (out_leaf, tensor) in outputs.into_iter().enumerate() {
-                let kinds = &node_consumers[out_leaf];
-                if kinds.is_empty() {
-                    continue;
-                }
-                let mut iter = kinds.iter();
-                let last_kind = iter.next_back().unwrap();
-                for kind in iter {
-                    dispatch(kind, tensor.clone(), &mut input_buffer, &mut output_tensors);
-                }
-                dispatch(last_kind, tensor, &mut input_buffer, &mut output_tensors);
-            }
+            dispatch_all(
+                &node_consumers,
+                outputs,
+                &mut input_buffer,
+                &mut output_values,
+            );
         }
 
         Ok(self
@@ -791,7 +865,7 @@ impl ProgramNode for QuantumProgram {
             .iter()
             .enumerate()
             .map(|(i, (key, _, _))| {
-                output_tensors[i]
+                output_values[i]
                     .take()
                     .unwrap_or_else(|| unreachable!("program output {key:?} was not produced"))
             })
@@ -799,23 +873,45 @@ impl ProgramNode for QuantumProgram {
     }
 }
 
-/// Send `tensor` to its consumer (downstream input slot or program output).
-fn dispatch(
+/// Send `value` to its consumer (downstream input slot or program output).
+fn dispatch<T>(
     kind: &ConsumerKind,
-    tensor: Tensor,
-    input_buffer: &mut [Vec<Option<Tensor>>],
-    output_tensors: &mut [Option<Tensor>],
+    value: T,
+    input_buffer: &mut [Vec<Option<T>>],
+    output_values: &mut [Option<T>],
 ) {
     match kind {
         ConsumerKind::Edge {
             target_topo_idx,
             target_leaf,
         } => {
-            input_buffer[*target_topo_idx][*target_leaf] = Some(tensor);
+            input_buffer[*target_topo_idx][*target_leaf] = Some(value);
         }
         ConsumerKind::ProgramOutput { output_idx } => {
-            output_tensors[*output_idx] = Some(tensor);
+            output_values[*output_idx] = Some(value);
         }
+    }
+}
+
+/// Dispatch a node's `outputs` (indexed by output leaf) to all of `node_consumers`,
+/// cloning for all but the last consumer of each leaf.
+fn dispatch_all<T: Clone>(
+    node_consumers: &[Vec<ConsumerKind>],
+    outputs: Vec<T>,
+    input_buffer: &mut [Vec<Option<T>>],
+    output_values: &mut [Option<T>],
+) {
+    for (out_leaf, value) in outputs.into_iter().enumerate() {
+        let kinds = &node_consumers[out_leaf];
+        if kinds.is_empty() {
+            continue;
+        }
+        let mut iter = kinds.iter();
+        let last_kind = iter.next_back().unwrap();
+        for kind in iter {
+            dispatch(kind, value.clone(), input_buffer, output_values);
+        }
+        dispatch(last_kind, value, input_buffer, output_values);
     }
 }
 
@@ -828,7 +924,7 @@ mod tests {
     use super::*;
     use crate::program_node::MissingCallError;
     use crate::store::Store;
-    use crate::tensor::{DTypeLike, Tensor, TensorType};
+    use crate::tensor::{DType, DTypeLike, Dim, Tensor, TensorType};
     use std::sync::OnceLock;
 
     fn make_store(val: f64) -> Store {
@@ -1024,7 +1120,7 @@ mod tests {
 
     #[test]
     fn test_fanout_same_output_to_two_inputs() {
-        use crate::math_nodes::binary::Add;
+        use crate::math_nodes::Add;
         let mut prog = QuantumProgram::new();
         prog.add_node("s", make_store(1.0)).unwrap();
         prog.add_node("add", Add).unwrap();
@@ -1054,7 +1150,7 @@ mod tests {
     #[test]
     fn test_call_store_add_pipeline() {
         // s1(3.0) and s2(5.0) feed into Add; result is exported.
-        use crate::math_nodes::binary::Add;
+        use crate::math_nodes::Add;
         let mut prog = QuantumProgram::new();
         prog.add_node("s1", make_store(3.0)).unwrap();
         prog.add_node("s2", make_store(5.0)).unwrap();
@@ -1075,7 +1171,7 @@ mod tests {
     #[test]
     fn test_call_with_program_input() {
         // A Store provides one operand of Add; the other comes from a program input.
-        use crate::math_nodes::binary::Add;
+        use crate::math_nodes::Add;
         let mut prog = QuantumProgram::new();
         prog.add_node("s", make_store(10.0)).unwrap();
         prog.add_node("add", Add).unwrap();
@@ -1097,7 +1193,7 @@ mod tests {
         // Address a Store output by Index(0) and confirm it resolves to the
         // same leaf as Key("a") — re-using either name on the same downstream
         // input should report it as already occupied.
-        use crate::math_nodes::binary::Add;
+        use crate::math_nodes::Add;
         let mut data = DataTree::new();
         data.insert_leaf("a", Tensor::from([1.0_f64]));
         data.insert_leaf("b", Tensor::from([2.0_f64]));
@@ -1119,5 +1215,107 @@ mod tests {
             err,
             QuantumProgramError::PortAlreadyConnected { .. }
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_types_flat
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_types_flat_store_add_mean_chain() {
+        // s1(2x3) + s2(3) broadcasts to (2,3); mean(axis=0) removes axis 0 -> shape (3,).
+        use crate::math_nodes::{Add, Mean};
+        let mut prog = QuantumProgram::new();
+        let s1 = Store::new(DataTree::new_leaf(Tensor::F64(
+            ndarray::arr2(&[[1.0_f64, 2.0, 3.0], [4.0, 5.0, 6.0]])
+                .into_dyn()
+                .into_shared(),
+        )));
+        prog.add_node("s1", s1).unwrap();
+        prog.add_node("s2", make_store(1.0)).unwrap();
+        prog.add_node("add", Add).unwrap();
+        prog.add_node("mean", Mean::new(0)).unwrap();
+        prog.add_edge(Port::new("s1", vec![]), Port::new("add", vec!["x".into()]))
+            .unwrap();
+        prog.add_edge(Port::new("s2", vec![]), Port::new("add", vec!["y".into()]))
+            .unwrap();
+        prog.add_edge(Port::new("add", vec![]), Port::new("mean", vec![]))
+            .unwrap();
+        prog.set_output("result", Port::new("mean", vec![]))
+            .unwrap();
+
+        // Resolved without ever calling `call_flat`.
+        let resolved = prog.resolve_types_flat(&[]).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert!(matches!(resolved[0].dtype, DTypeLike::Concrete(DType::F64)));
+        assert_eq!(resolved[0].shape, vec![Dim::Fixed(3)]);
+    }
+
+    #[test]
+    fn test_resolve_types_flat_incompatible_shapes_errors_before_call() {
+        // s1 has shape (3,), s2 has shape (4,): not broadcast-compatible.
+        // `resolve_types_flat` must catch this without `call_flat` ever running.
+        use crate::math_nodes::Add;
+        let mut prog = QuantumProgram::new();
+        prog.add_node(
+            "s1",
+            Store::new(DataTree::new_leaf(Tensor::from([1.0_f64, 2.0, 3.0]))),
+        )
+        .unwrap();
+        prog.add_node(
+            "s2",
+            Store::new(DataTree::new_leaf(Tensor::from([1.0_f64, 2.0, 3.0, 4.0]))),
+        )
+        .unwrap();
+        prog.add_node("add", Add).unwrap();
+        prog.add_edge(Port::new("s1", vec![]), Port::new("add", vec!["x".into()]))
+            .unwrap();
+        prog.add_edge(Port::new("s2", vec![]), Port::new("add", vec!["y".into()]))
+            .unwrap();
+        prog.set_output("result", Port::new("add", vec![])).unwrap();
+
+        let err = prog.resolve_types_flat(&[]).unwrap_err();
+        assert!(matches!(
+            err,
+            QuantumProgramCallError::NodeTypeResolution { ref label, .. } if label == "add"
+        ));
+    }
+
+    #[test]
+    fn test_resolve_types_flat_nested_quantum_program() {
+        // Inner program: Store(1) + program-input "y" -> declared output "sum".
+        // Nesting it as a node in an outer program must still exercise Add's real
+        // (non-default) `resolve_types_flat` through the `DynNode`/`Adapter` erasure.
+        use crate::math_nodes::Add;
+        let mut inner = QuantumProgram::new();
+        inner.add_node("s", make_store(1.0)).unwrap();
+        inner.add_node("add", Add).unwrap();
+        inner
+            .add_edge(Port::new("s", vec![]), Port::new("add", vec!["x".into()]))
+            .unwrap();
+        inner
+            .set_input("y", Port::new("add", vec!["y".into()]))
+            .unwrap();
+        inner.set_output("sum", Port::new("add", vec![])).unwrap();
+
+        let mut outer = QuantumProgram::new();
+        outer.add_node("inner", inner).unwrap();
+        outer
+            .set_input("y", Port::new("inner", vec!["y".into()]))
+            .unwrap();
+        outer
+            .set_output("result", Port::new("inner", vec!["sum".into()]))
+            .unwrap();
+
+        let resolved = outer
+            .resolve_types_flat(&[TensorType {
+                dtype: DTypeLike::Concrete(DType::F64),
+                shape: vec![Dim::Fixed(1)],
+                broadcastable: true,
+            }])
+            .unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert!(matches!(resolved[0].dtype, DTypeLike::Concrete(DType::F64)));
+        assert_eq!(resolved[0].shape, vec![Dim::Fixed(1)]);
     }
 }

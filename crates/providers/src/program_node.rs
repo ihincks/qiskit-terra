@@ -139,6 +139,33 @@ pub trait ProgramNode {
     /// error if they find tensors that they don't like.
     /// [`ProgramNodeExt::call`] and [`QuantumProgram::call_flat`] both do.
     fn call_flat(&self, args: &[Tensor]) -> Result<Vec<Tensor>, Self::CallError>;
+
+    /// Resolve this node's output types with flattened I/O.
+    ///
+    /// `input_types` is in input-tree DFS leaf order matching [`ProgramNode::input_types`]
+    /// and the returned vector is in output-tree DFS leaf order matching
+    /// [`ProgramNode::output_types`]. This lets a node express shape/dtype dependence on
+    /// its inputs (e.g. NumPy-style broadcasting, axis-removing reductions) as a real
+    /// functional dependency, so mismatches can be caught before [`ProgramNode::call_flat`]
+    /// ever runs, rather than only surfacing once real tensors are involved.
+    ///
+    /// The default implementation returns the frozen [`ProgramNode::output_types`] template
+    /// unchanged, which is correct for nodes whose output types are independent of their
+    /// input types (e.g. [`crate::Store`]).
+    ///
+    /// # Panics
+    ///
+    /// Implementations are allowed to panic if `input_types.len()` does not equal the leaf
+    /// count of [`ProgramNode::input_types`]; callers are responsible for upholding this
+    /// invariant. On the other hand, implementations should raise a call error if they find
+    /// types that they don't like. [`ProgramNodeExt::resolve_types`] and
+    /// [`QuantumProgram::resolve_types_flat`] both do.
+    fn resolve_types_flat(
+        &self,
+        _input_types: &[TensorType],
+    ) -> Result<Vec<TensorType>, Self::CallError> {
+        Ok(self.output_types().iter_leaves().cloned().collect())
+    }
 }
 
 /// Extension with the wrapper over [`ProgramNode::call_flat`] whose I/O are data trees.
@@ -158,6 +185,113 @@ pub trait ProgramNodeExt: ProgramNode {
         let out = self.call_flat(&flat).map_err(CallError::Call)?;
         self.output_types().unflatten(out).map_err(Into::into)
     }
+
+    /// Resolve this node's output types given the types actually wired to its inputs.
+    fn resolve_types(
+        &self,
+        input_types: &DataTree<TensorType>,
+    ) -> Result<DataTree<TensorType>, CallError<Self::CallError>> {
+        let flat = self
+            .input_types()
+            .flatten_against(input_types)
+            .map_err(|e| CallError::Input(e.into()))?;
+        let out = self.resolve_types_flat(&flat).map_err(CallError::Call)?;
+        self.output_types().unflatten(out).map_err(Into::into)
+    }
 }
 
 impl<T: ProgramNode + ?Sized> ProgramNodeExt for T {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tensor::{DTypeLike, Dim};
+    use std::sync::OnceLock;
+
+    /// A node that doesn't override `resolve_types_flat`, to exercise the default.
+    struct FixedNode;
+
+    impl ProgramNode for FixedNode {
+        type CallError = MissingCallError;
+        fn name(&self) -> &'static str {
+            "fixed"
+        }
+        fn namespace(&self) -> &'static str {
+            "test"
+        }
+        fn input_types(&self) -> &DataTree<TensorType> {
+            static LOCK: OnceLock<DataTree<TensorType>> = OnceLock::new();
+            LOCK.get_or_init(|| {
+                DataTree::new_leaf(TensorType {
+                    dtype: DTypeLike::Concrete(DType::F64),
+                    shape: vec![Dim::Fixed(3)],
+                    broadcastable: false,
+                })
+            })
+        }
+        fn output_types(&self) -> &DataTree<TensorType> {
+            static LOCK: OnceLock<DataTree<TensorType>> = OnceLock::new();
+            LOCK.get_or_init(|| {
+                DataTree::new_leaf(TensorType {
+                    dtype: DTypeLike::Concrete(DType::Bit),
+                    shape: vec![Dim::Fixed(5)],
+                    broadcastable: false,
+                })
+            })
+        }
+        fn implements_call(&self) -> bool {
+            false
+        }
+        fn call_flat(&self, _args: &[Tensor]) -> Result<Vec<Tensor>, MissingCallError> {
+            Err(MissingCallError::new(self.full_name()))
+        }
+    }
+
+    #[test]
+    fn test_default_resolve_types_flat_returns_output_types() {
+        let node = FixedNode;
+        let input = TensorType {
+            dtype: DTypeLike::Concrete(DType::F64),
+            shape: vec![Dim::Fixed(999)],
+            broadcastable: false,
+        };
+        let result = node.resolve_types_flat(&[input]).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(matches!(result[0].dtype, DTypeLike::Concrete(DType::Bit)));
+        assert_eq!(result[0].shape, vec![Dim::Fixed(5)]);
+    }
+
+    #[test]
+    fn test_default_resolve_types_tree_wrapper() {
+        let node = FixedNode;
+        let input = DataTree::new_leaf(TensorType {
+            dtype: DTypeLike::Concrete(DType::F64),
+            shape: vec![Dim::Fixed(3)],
+            broadcastable: false,
+        });
+        let result = node.resolve_types(&input).unwrap();
+        let leaf = result.unwrap_leaf();
+        assert!(matches!(leaf.dtype, DTypeLike::Concrete(DType::Bit)));
+        assert_eq!(leaf.shape, vec![Dim::Fixed(5)]);
+    }
+
+    #[test]
+    fn test_resolve_types_input_mismatch_errors() {
+        let node = FixedNode;
+        // A branch where a leaf is expected.
+        let mut input = DataTree::new();
+        input.insert_leaf(
+            "a",
+            TensorType {
+                dtype: DTypeLike::Concrete(DType::F64),
+                shape: vec![],
+                broadcastable: false,
+            },
+        );
+        let err = node.resolve_types(&input).unwrap_err();
+        assert!(matches!(
+            err,
+            CallError::Input(CallInputError::ExpectedLeaf { ref key }) if key.is_empty()
+        ));
+    }
+}

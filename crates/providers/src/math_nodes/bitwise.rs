@@ -12,7 +12,7 @@
 
 use crate::data_tree::DataTree;
 use crate::program_node::{CallInputError, ProgramNode};
-use crate::tensor::{DType, DTypeLike, Tensor, TensorType, broadcast_shape};
+use crate::tensor::{DType, DTypeLike, Tensor, TensorType, broadcast_dims, broadcast_shape};
 use crate::unpack_tensor_args;
 use ndarray::Axis;
 use std::sync::LazyLock;
@@ -48,13 +48,22 @@ static LEAF_TYPE: LazyLock<DataTree<TensorType>> = LazyLock::new(|| {
     })
 });
 
-/// Construct an `UnexpectedDType` error for a slice element that did not match
+/// Construct an `UnexpectedDType` error for a value that did not match
 /// the schema's required dtype.
-fn unexpected_dtype(key: &str, actual: &Tensor) -> CallInputError {
+fn unexpected_dtype(key: &str, actual: DType) -> CallInputError {
     CallInputError::UnexpectedDType {
         key: key.into(),
         expected: DType::Bit.to_string(),
-        actual: actual.dtype(),
+        actual,
+    }
+}
+
+/// Validate that a declared (possibly symbolic) dtype is `Bit`, deferring to `call_flat`
+/// when the dtype is not yet resolved to a concrete type.
+fn check_bit_dtype(key: &str, dtype: &DTypeLike) -> Result<(), CallInputError> {
+    match dtype {
+        DTypeLike::Concrete(d) if *d != DType::Bit => Err(unexpected_dtype(key, *d)),
+        _ => Ok(()),
     }
 }
 
@@ -85,13 +94,27 @@ macro_rules! bitwise_binary_node {
             fn call_flat(&self, args: &[Tensor]) -> Result<Vec<Tensor>, Self::CallError> {
                 unpack_tensor_args!(args, [x, y]);
                 let Tensor::Bit(x_arr) = x else {
-                    return Err(unexpected_dtype("x", x).into());
+                    return Err(unexpected_dtype("x", x.dtype()).into());
                 };
                 let Tensor::Bit(y_arr) = y else {
-                    return Err(unexpected_dtype("y", y).into());
+                    return Err(unexpected_dtype("y", y.dtype()).into());
                 };
                 broadcast_shape(x_arr.shape(), y_arr.shape())?;
                 Ok(vec![Tensor::Bit($call_fn(x_arr, y_arr).into_shared())])
+            }
+            fn resolve_types_flat(
+                &self,
+                input_types: &[TensorType],
+            ) -> Result<Vec<TensorType>, Self::CallError> {
+                unpack_tensor_args!(input_types, [x, y]);
+                check_bit_dtype("x", &x.dtype)?;
+                check_bit_dtype("y", &y.dtype)?;
+                let shape = broadcast_dims(&x.shape, &y.shape)?;
+                Ok(vec![TensorType {
+                    dtype: DTypeLike::Concrete(DType::Bit),
+                    shape,
+                    broadcastable: true,
+                }])
             }
         }
     };
@@ -125,9 +148,17 @@ impl ProgramNode for BitwiseNot {
     fn call_flat(&self, args: &[Tensor]) -> Result<Vec<Tensor>, Self::CallError> {
         unpack_tensor_args!(args, [x]);
         let Tensor::Bit(arr) = x else {
-            return Err(unexpected_dtype("", x).into());
+            return Err(unexpected_dtype("", x.dtype()).into());
         };
         Ok(vec![Tensor::Bit(arr.mapv(|b| b ^ 1).into_shared())])
+    }
+    fn resolve_types_flat(
+        &self,
+        input_types: &[TensorType],
+    ) -> Result<Vec<TensorType>, Self::CallError> {
+        unpack_tensor_args!(input_types, [x]);
+        check_bit_dtype("", &x.dtype)?;
+        Ok(vec![x.clone()])
     }
 }
 
@@ -169,12 +200,27 @@ impl ProgramNode for Parity {
         unpack_tensor_args!(args, [x]);
         super::check_axis(self.axis, x.shape().len())?;
         let Tensor::Bit(arr) = x else {
-            return Err(unexpected_dtype("", x).into());
+            return Err(unexpected_dtype("", x.dtype()).into());
         };
         Ok(vec![Tensor::Bit(
             arr.fold_axis(Axis(self.axis), 0u8, |&acc, &b| acc ^ b)
                 .into_shared(),
         )])
+    }
+    fn resolve_types_flat(
+        &self,
+        input_types: &[TensorType],
+    ) -> Result<Vec<TensorType>, Self::CallError> {
+        unpack_tensor_args!(input_types, [x]);
+        super::check_axis(self.axis, x.shape.len())?;
+        check_bit_dtype("", &x.dtype)?;
+        let mut shape = x.shape.clone();
+        shape.remove(self.axis);
+        Ok(vec![TensorType {
+            dtype: x.dtype.clone(),
+            shape,
+            broadcastable: x.broadcastable,
+        }])
     }
 }
 
@@ -339,6 +385,151 @@ mod tests {
     #[test]
     fn test_parity_axis_out_of_bounds_errors() {
         let err = Parity::new(1).call_flat(&[bit(&[1, 0, 1])]).unwrap_err();
+        assert_eq!(err, MathNodeError::InvalidAxis { axis: 1, ndim: 1 });
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_types_flat
+    // -----------------------------------------------------------------------
+
+    use crate::tensor::Dim;
+
+    fn concrete_bit(shape: Vec<Dim>) -> TensorType {
+        TensorType {
+            dtype: DTypeLike::Concrete(DType::Bit),
+            shape,
+            broadcastable: true,
+        }
+    }
+
+    #[test]
+    fn test_bitwise_and_resolve_types_flat_matches_call_flat() {
+        let called = BitwiseAnd
+            .call_flat(&[bit(&[1, 0, 1]), bit(&[1, 1, 0])])
+            .unwrap();
+        let resolved = BitwiseAnd
+            .resolve_types_flat(&[
+                concrete_bit(vec![Dim::Fixed(3)]),
+                concrete_bit(vec![Dim::Fixed(3)]),
+            ])
+            .unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert!(matches!(resolved[0].dtype, DTypeLike::Concrete(DType::Bit)));
+        assert_eq!(resolved[0].shape, vec![Dim::Fixed(3)]);
+        assert_eq!(called[0].shape(), &[3]);
+    }
+
+    #[test]
+    fn test_bitwise_and_resolve_types_flat_broadcasts() {
+        let resolved = BitwiseAnd
+            .resolve_types_flat(&[
+                concrete_bit(vec![Dim::Fixed(3)]),
+                concrete_bit(vec![Dim::Fixed(1)]),
+            ])
+            .unwrap();
+        assert_eq!(resolved[0].shape, vec![Dim::Fixed(3)]);
+    }
+
+    #[test]
+    fn test_bitwise_and_resolve_types_flat_wrong_dtype_errors() {
+        let err = BitwiseAnd
+            .resolve_types_flat(&[
+                TensorType {
+                    dtype: DTypeLike::Concrete(DType::F64),
+                    shape: vec![],
+                    broadcastable: true,
+                },
+                concrete_bit(vec![]),
+            ])
+            .unwrap_err();
+        assert_eq!(
+            err,
+            MathNodeError::Input(CallInputError::UnexpectedDType {
+                key: "x".to_string(),
+                expected: "Bit".to_string(),
+                actual: DType::F64,
+            })
+        );
+    }
+
+    #[test]
+    fn test_bitwise_and_resolve_types_flat_incompatible_shapes_errors() {
+        let err = BitwiseAnd
+            .resolve_types_flat(&[
+                concrete_bit(vec![Dim::Fixed(3)]),
+                concrete_bit(vec![Dim::Fixed(4)]),
+            ])
+            .unwrap_err();
+        assert!(matches!(err, MathNodeError::Tensor(_)));
+    }
+
+    #[test]
+    fn test_bitwise_and_resolve_types_flat_permits_symbolic_dtype() {
+        // A symbolic (unresolved) dtype is not checked against `Bit` here — that
+        // validation is deferred to `call_flat` once the dtype is concrete.
+        let resolved = BitwiseAnd
+            .resolve_types_flat(&[
+                TensorType {
+                    dtype: DTypeLike::Var("x".into()),
+                    shape: vec![Dim::Fixed(3)],
+                    broadcastable: true,
+                },
+                concrete_bit(vec![Dim::Fixed(3)]),
+            ])
+            .unwrap();
+        assert!(matches!(resolved[0].dtype, DTypeLike::Concrete(DType::Bit)));
+    }
+
+    #[test]
+    fn test_bitwise_not_resolve_types_flat_passes_through() {
+        let input = concrete_bit(vec![Dim::Fixed(4)]);
+        let resolved = BitwiseNot
+            .resolve_types_flat(std::slice::from_ref(&input))
+            .unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert!(matches!(resolved[0].dtype, DTypeLike::Concrete(DType::Bit)));
+        assert_eq!(resolved[0].shape, input.shape);
+        assert_eq!(resolved[0].broadcastable, input.broadcastable);
+    }
+
+    #[test]
+    fn test_bitwise_not_resolve_types_flat_wrong_dtype_errors() {
+        let err = BitwiseNot
+            .resolve_types_flat(&[TensorType {
+                dtype: DTypeLike::Concrete(DType::F64),
+                shape: vec![],
+                broadcastable: true,
+            }])
+            .unwrap_err();
+        assert_eq!(
+            err,
+            MathNodeError::Input(CallInputError::UnexpectedDType {
+                key: "".to_string(),
+                expected: "Bit".to_string(),
+                actual: DType::F64,
+            })
+        );
+    }
+
+    #[test]
+    fn test_parity_resolve_types_flat_removes_axis() {
+        let called = Parity::new(0)
+            .call_flat(&[Tensor::Bit(
+                arr2(&[[1u8, 0, 1], [0, 1, 1]]).into_dyn().into_shared(),
+            )])
+            .unwrap();
+        let resolved = Parity::new(0)
+            .resolve_types_flat(&[concrete_bit(vec![Dim::Fixed(2), Dim::Fixed(3)])])
+            .unwrap();
+        assert_eq!(resolved[0].shape, vec![Dim::Fixed(3)]);
+        assert_eq!(called[0].shape(), &[3]);
+    }
+
+    #[test]
+    fn test_parity_resolve_types_flat_axis_out_of_bounds_errors() {
+        let err = Parity::new(1)
+            .resolve_types_flat(&[concrete_bit(vec![Dim::Fixed(3)])])
+            .unwrap_err();
         assert_eq!(err, MathNodeError::InvalidAxis { axis: 1, ndim: 1 });
     }
 }

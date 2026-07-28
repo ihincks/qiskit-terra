@@ -29,6 +29,12 @@ pub enum TensorError {
     /// The two operand shapes are not broadcast-compatible.
     #[error("shapes {lhs:?} and {rhs:?} are not broadcast-compatible")]
     ShapeMismatch { lhs: Vec<usize>, rhs: Vec<usize> },
+    /// The two operand [`Dim`] shapes are provably not broadcast-compatible.
+    ///
+    /// This is the type-level counterpart of [`TensorError::ShapeMismatch`], raised by
+    /// [`broadcast_dims`] when resolving declared (not necessarily concrete) shapes.
+    #[error("shapes {lhs:?} and {rhs:?} are not broadcast-compatible")]
+    DimShapeMismatch { lhs: Vec<Dim>, rhs: Vec<Dim> },
 }
 
 /// The possible data types for a Tensor.
@@ -331,6 +337,50 @@ pub fn broadcast_shape(a: &[usize], b: &[usize]) -> Result<Vec<usize>, TensorErr
         .collect()
 }
 
+/// Compute the type-level NumPy-style broadcast shape for two operand shapes, or
+/// return [`TensorError::DimShapeMismatch`] if they are provably not broadcast-compatible.
+///
+/// This is the [`Dim`]-level counterpart of [`broadcast_shape`], used to predict a node's
+/// declared output shape from its declared input shapes without any concrete tensor data.
+/// [`Dim::Named`] axes are treated as unknown but not necessarily incompatible:
+///
+/// - `Fixed(1)` broadcasts against anything, same as [`broadcast_shape`].
+/// - `Fixed(m)` vs `Fixed(n)` with `m != n` (neither `1`) is a build-time-detectable error.
+/// - `Fixed(m)` vs `Named(_)` conservatively resolves to `Fixed(m)` — the concrete side wins
+///   rather than raising a false-positive error.
+/// - `Named(_)` vs `Named(_)` resolves to one of the two names. There is no
+///   unification/constraint-solving across separately named dims: two occurrences of
+///   `Named("n")` are not tracked as referring to the same size.
+pub fn broadcast_dims(a: &[Dim], b: &[Dim]) -> Result<Vec<Dim>, TensorError> {
+    let ndim = a.len().max(b.len());
+    (0..ndim)
+        .map(|i| {
+            let dim_a = if i >= ndim - a.len() {
+                a[i - (ndim - a.len())].clone()
+            } else {
+                Dim::Fixed(1)
+            };
+            let dim_b = if i >= ndim - b.len() {
+                b[i - (ndim - b.len())].clone()
+            } else {
+                Dim::Fixed(1)
+            };
+            match (dim_a, dim_b) {
+                (Dim::Fixed(1), y) => Ok(y),
+                (x, Dim::Fixed(1)) => Ok(x),
+                (Dim::Fixed(m), Dim::Fixed(n)) if m == n => Ok(Dim::Fixed(m)),
+                (Dim::Fixed(_), Dim::Fixed(_)) => Err(TensorError::DimShapeMismatch {
+                    lhs: a.to_vec(),
+                    rhs: b.to_vec(),
+                }),
+                (Dim::Fixed(m), Dim::Named(_)) => Ok(Dim::Fixed(m)),
+                (Dim::Named(_), Dim::Fixed(n)) => Ok(Dim::Fixed(n)),
+                (Dim::Named(name), Dim::Named(_)) => Ok(Dim::Named(name)),
+            }
+        })
+        .collect()
+}
+
 /// Element-wise binary operation on two arrays with NumPy-style broadcasting.
 ///
 /// Unlike ndarray's built-in arithmetic operators which handle broadcasting automatically,
@@ -574,8 +624,8 @@ impl Tensor {
     /// Element-wise `/`.
     ///
     /// Float and complex operands divide directly, preserving their dtype.
-    /// Integer and `Bit` operands are cast to `f64` before dividing, so the result 
-    /// is always `F64` and a zero divisor produces `inf`/`-inf`/`NaN` instead of 
+    /// Integer and `Bit` operands are cast to `f64` before dividing, so the result
+    /// is always `F64` and a zero divisor produces `inf`/`-inf`/`NaN` instead of
     /// panicking or raising an error.
     ///
     /// Returns [`TensorError::DTypeMismatch`] if the operand dtypes differ
@@ -629,7 +679,7 @@ impl std::ops::Div for Tensor {
 impl Tensor {
     /// Element-wise `%` (real dtypes only).
     ///
-    /// Float operands use plain `%` where a zero divisor yields NaN. 
+    /// Float operands use plain `%` where a zero divisor yields NaN.
     /// Integer operands result in `0` on zero divisor.
     ///
     /// Returns [`TensorError::DTypeMismatch`] if the operand dtypes differ or
@@ -1275,6 +1325,81 @@ mod test {
         let a = Tensor::from([1.0f64, 2.0, 3.0]);
         let b = Tensor::from([1.0f64, 2.0, 3.0, 4.0]);
         let _ = &a + &b;
+    }
+
+    // -----------------------------------------------------------------------
+    // broadcast_dims (type-level broadcasting)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_broadcast_dims_concrete_compatible() {
+        // [2, 3] vs [3] -> [2, 3], mirroring broadcast_shape.
+        let a = vec![Dim::Fixed(2), Dim::Fixed(3)];
+        let b = vec![Dim::Fixed(3)];
+        assert_eq!(
+            broadcast_dims(&a, &b).unwrap(),
+            vec![Dim::Fixed(2), Dim::Fixed(3)]
+        );
+
+        // Scalar broadcast: [4] vs [1] -> [4].
+        assert_eq!(
+            broadcast_dims(&[Dim::Fixed(4)], &[Dim::Fixed(1)]).unwrap(),
+            vec![Dim::Fixed(4)]
+        );
+    }
+
+    #[test]
+    fn test_broadcast_dims_concrete_incompatible_errors() {
+        let a = vec![Dim::Fixed(3)];
+        let b = vec![Dim::Fixed(4)];
+        let err = broadcast_dims(&a, &b).unwrap_err();
+        match err {
+            TensorError::DimShapeMismatch { lhs, rhs } => {
+                assert_eq!(lhs, a);
+                assert_eq!(rhs, b);
+            }
+            _ => panic!("expected DimShapeMismatch, got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn test_broadcast_dims_one_side_named() {
+        // Fixed(m) vs Named(_) conservatively resolves to Fixed(m).
+        let a = vec![Dim::Fixed(5)];
+        let b = vec![Dim::Named("n".into())];
+        assert_eq!(broadcast_dims(&a, &b).unwrap(), vec![Dim::Fixed(5)]);
+        assert_eq!(broadcast_dims(&b, &a).unwrap(), vec![Dim::Fixed(5)]);
+
+        // Named(_) vs Fixed(1) resolves to the Named side (Fixed(1) broadcasts away).
+        let named = vec![Dim::Named("n".into())];
+        let one = vec![Dim::Fixed(1)];
+        assert_eq!(broadcast_dims(&named, &one).unwrap(), named);
+    }
+
+    #[test]
+    fn test_broadcast_dims_both_named() {
+        // Same name propagates unchanged.
+        let a = vec![Dim::Named("n".into())];
+        assert_eq!(broadcast_dims(&a, &a).unwrap(), a);
+
+        // Different names: no unification, one of the two names propagates
+        // (no error is raised — this is a known, accepted limitation).
+        let b = vec![Dim::Named("m".into())];
+        let result = broadcast_dims(&a, &b).unwrap();
+        assert!(matches!(&result[0], Dim::Named(_)));
+    }
+
+    #[test]
+    fn test_broadcast_dims_differing_ranks() {
+        // [2, 1, 3] vs [3] -> [2, 1, 3] (missing leading axes act as Fixed(1)).
+        let a = vec![Dim::Fixed(2), Dim::Fixed(1), Dim::Fixed(3)];
+        let b = vec![Dim::Fixed(3)];
+        assert_eq!(broadcast_dims(&a, &b).unwrap(), a);
+
+        // [2, 1, 3] vs [Named] -> [2, 1, 3] (concrete side wins against the
+        // implicit Fixed(1) padding AND against the trailing Named axis).
+        let c = vec![Dim::Named("n".into())];
+        assert_eq!(broadcast_dims(&a, &c).unwrap(), a);
     }
 
     // -----------------------------------------------------------------------
