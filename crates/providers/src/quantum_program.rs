@@ -19,6 +19,10 @@ use rustworkx_core::dag_algo::lexicographical_topological_sort;
 use rustworkx_core::petgraph::graph::{DiGraph, NodeIndex};
 use thiserror::Error;
 
+mod regions;
+
+pub use regions::{ContractedProgram, ContractionError, ProgramRegion};
+
 // ---------------------------------------------------------------------------
 // Local owned-path types and helpers (formerly in data_tree)
 // Used by Port::path, error types, and NodeView's leaf path cache.
@@ -307,6 +311,22 @@ struct NodeView {
 }
 
 impl NodeView {
+    /// Snapshot `node`'s DFS leaf paths. Per [`ProgramNode`]'s schema-stability
+    /// invariant, the node's IO trees are treated as frozen from here on.
+    fn new(node: DynNode) -> Self {
+        let input_leaf_paths = iter_owned_paths(node.input_types())
+            .map(|(p, _)| p)
+            .collect();
+        let output_leaf_paths = iter_owned_paths(node.output_types())
+            .map(|(p, _)| p)
+            .collect();
+        Self {
+            node,
+            input_leaf_paths,
+            output_leaf_paths,
+        }
+    }
+
     fn leaf_paths(&self, side: PortSide) -> &[OwnedPath] {
         match side {
             PortSide::Input => &self.input_leaf_paths,
@@ -368,6 +388,9 @@ impl DynNode {
                     .resolve_types_flat(input_types)
                     .map_err(|e| Box::new(e) as BoxedNodeError)
             }
+            fn as_quantum_program(&self) -> Option<&QuantumProgram> {
+                self.0.as_quantum_program()
+            }
         }
         DynNode(Box::new(Adapter(node)))
     }
@@ -398,6 +421,9 @@ impl ProgramNode for DynNode {
         input_types: &[TensorType],
     ) -> Result<Vec<TensorType>, BoxedNodeError> {
         self.0.resolve_types_flat(input_types)
+    }
+    fn as_quantum_program(&self) -> Option<&QuantumProgram> {
+        self.0.as_quantum_program()
     }
 }
 
@@ -482,26 +508,7 @@ impl QuantumProgram {
         N: ProgramNode + 'static,
         N::CallError: std::error::Error + Send + Sync + 'static,
     {
-        let label = label.into();
-        if self.label_to_node.contains_key(&label) {
-            return Err(QuantumProgramError::DuplicateLabel(label));
-        }
-        let dyn_node = DynNode::new(node);
-        let input_leaf_paths: Vec<OwnedPath> = iter_owned_paths(dyn_node.input_types())
-            .map(|(p, _)| p)
-            .collect();
-        let output_leaf_paths: Vec<OwnedPath> = iter_owned_paths(dyn_node.output_types())
-            .map(|(p, _)| p)
-            .collect();
-        let n_inputs = input_leaf_paths.len();
-        let view = NodeView {
-            node: dyn_node,
-            input_leaf_paths,
-            output_leaf_paths,
-        };
-        let idx = self.graph.add_node(view);
-        self.label_to_node.insert(label, idx);
-        self.occupied_input_ports.insert(idx, vec![false; n_inputs]);
+        self.add_node_view(label.into(), NodeView::new(DynNode::new(node)))?;
         Ok(())
     }
 
@@ -562,9 +569,9 @@ impl QuantumProgram {
             return Err(QuantumProgramError::DuplicateIOKey(key.to_string()));
         }
         let label = format!("__input_{key}");
-        self.add_node(label.clone(), Input::new(spec))?;
-        let idx = self.label_to_node[&label];
-        self.input_source_nodes.push((key.to_string(), idx));
+        let idx =
+            self.add_node_view(label.clone(), NodeView::new(DynNode::new(Input::new(spec))))?;
+        self.declare_input_source(key.to_string(), idx);
         self.rebuild_io_types();
         Ok(Port::new(label, vec![]))
     }
@@ -633,6 +640,36 @@ impl QuantumProgram {
     // -----------------------------------------------------------------------
     // Private helpers
     // -----------------------------------------------------------------------
+
+    /// Insert an already-built [`NodeView`] under `label`, which must be unique.
+    ///
+    /// The node's occupied-input-port bookkeeping is initialised to all-unoccupied, so a
+    /// view moved out of another program (see
+    /// [`Self::into_regions`](crate::QuantumProgram::into_regions)) starts clean and has
+    /// its connections re-derived through the ordinary
+    /// [`Self::add_edge`]/[`Self::set_input`] paths.
+    fn add_node_view(
+        &mut self,
+        label: String,
+        view: NodeView,
+    ) -> Result<NodeIndex, QuantumProgramError> {
+        if self.label_to_node.contains_key(&label) {
+            return Err(QuantumProgramError::DuplicateLabel(label));
+        }
+        let n_inputs = view.input_leaf_paths.len();
+        let idx = self.graph.add_node(view);
+        self.label_to_node.insert(label, idx);
+        self.occupied_input_ports.insert(idx, vec![false; n_inputs]);
+        Ok(idx)
+    }
+
+    /// Register `idx` as the backing [`Input`] source node for program input `key`.
+    ///
+    /// The caller is responsible for calling [`Self::rebuild_io_types`] afterwards and for
+    /// having already rejected a duplicate `key`.
+    fn declare_input_source(&mut self, key: String, idx: NodeIndex) {
+        self.input_source_nodes.push((key, idx));
+    }
 
     fn lookup_label(&self, label: &str) -> Result<NodeIndex, QuantumProgramError> {
         self.label_to_node
@@ -749,6 +786,10 @@ impl ProgramNode for QuantumProgram {
             |node, flat_types| node.resolve_types_flat(flat_types),
             |label, source| QuantumProgramCallError::NodeTypeResolution { label, source },
         )
+    }
+
+    fn as_quantum_program(&self) -> Option<&QuantumProgram> {
+        Some(self)
     }
 }
 

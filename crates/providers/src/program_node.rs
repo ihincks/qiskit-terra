@@ -11,6 +11,7 @@
 // that they have been altered from the originals.
 
 use crate::data_tree::{ArityMismatch, DataTree, TreeMatchError};
+use crate::quantum_program::QuantumProgram;
 use crate::tensor::{DType, Tensor, TensorType};
 use thiserror::Error;
 
@@ -165,6 +166,18 @@ pub trait ProgramNode {
         _input_types: &[TensorType],
     ) -> Result<Vec<TensorType>, Self::CallError> {
         Ok(self.output_types().iter_leaves().cloned().collect())
+    }
+
+    /// `Some(self)` if this node is a [`QuantumProgram`], else `None`.
+    ///
+    /// Nodes are stored type-erased behind a `dyn ProgramNode`, which has no `Any`
+    /// supertrait and so cannot be downcast. This accessor exists so that callers can
+    /// reach inside a nested program — most importantly the region nodes produced by
+    /// [`QuantumProgram::into_regions`](crate::QuantumProgram::into_regions).
+    ///
+    /// Only [`QuantumProgram`] overrides this; everything else keeps the `None` default.
+    fn as_quantum_program(&self) -> Option<&QuantumProgram> {
+        None
     }
 }
 

@@ -25,8 +25,8 @@ pub use data_tree::{ArityMismatch, DataTree, PathEntry, TreeMatchError};
 pub use input::Input;
 pub use program_node::{CallError, CallInputError, MissingCallError, ProgramNode, ProgramNodeExt};
 pub use quantum_program::{
-    BoxedNodeError, OwnedPath, OwnedPathEntry, Port, QuantumProgram, QuantumProgramCallError,
-    QuantumProgramError, format_path,
+    BoxedNodeError, ContractedProgram, ContractionError, OwnedPath, OwnedPathEntry, Port,
+    ProgramRegion, QuantumProgram, QuantumProgramCallError, QuantumProgramError, format_path,
 };
 pub use shot_loop::ShotLoop;
 pub use store::Store;
