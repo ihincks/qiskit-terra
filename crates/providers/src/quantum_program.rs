@@ -782,6 +782,14 @@ impl QuantumProgram {
         )
         .map_err(|_| QuantumProgramCallError::Cycle)?;
 
+        // `lexicographical_topological_sort` cannot report a cycle when called with
+        // `initial: None` — it silently returns a *truncated* order containing only the
+        // nodes it could reach. Detect that here: no nodes are ever removed from `graph`,
+        // so a short order means some nodes are trapped in a cycle.
+        if topo_order.len() != self.graph.node_count() {
+            return Err(QuantumProgramCallError::Cycle);
+        }
+
         let mut node_idx_to_topo_idx: Vec<Option<usize>> = vec![None; self.graph.node_bound()];
         for (topo_idx, &node_idx) in topo_order.iter().enumerate() {
             node_idx_to_topo_idx[node_idx.index()] = Some(topo_idx);
@@ -1278,6 +1286,44 @@ mod tests {
             err,
             QuantumProgramError::PortAlreadyConnected { .. }
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Cycles
+    // -----------------------------------------------------------------------
+
+    /// `a.out -> b.x` and `b.out -> a.x`, so both nodes are trapped in a cycle.
+    fn two_cycle() -> QuantumProgram {
+        let mut prog = QuantumProgram::new();
+        prog.add_node("a", BinaryTestNode).unwrap();
+        prog.add_node("b", BinaryTestNode).unwrap();
+        prog.add_edge(Port::new("a", vec![]), Port::new("b", vec!["x".into()]))
+            .unwrap();
+        prog.add_edge(Port::new("b", vec![]), Port::new("a", vec!["x".into()]))
+            .unwrap();
+        prog
+    }
+
+    #[test]
+    fn test_call_flat_cycle_returns_error() {
+        let err = two_cycle().call_flat(&[]).unwrap_err();
+        assert!(matches!(err, QuantumProgramCallError::Cycle));
+    }
+
+    #[test]
+    fn test_resolve_types_flat_cycle_returns_error() {
+        let err = two_cycle().resolve_types_flat(&[]).unwrap_err();
+        assert!(matches!(err, QuantumProgramCallError::Cycle));
+    }
+
+    #[test]
+    fn test_call_flat_self_loop_cycle_returns_error() {
+        let mut prog = QuantumProgram::new();
+        prog.add_node("a", BinaryTestNode).unwrap();
+        prog.add_edge(Port::new("a", vec![]), Port::new("a", vec!["x".into()]))
+            .unwrap();
+        let err = prog.call_flat(&[]).unwrap_err();
+        assert!(matches!(err, QuantumProgramCallError::Cycle));
     }
 
     // -----------------------------------------------------------------------
