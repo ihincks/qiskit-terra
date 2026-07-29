@@ -62,7 +62,13 @@ features_misc:
     This structure is described by the new :class:`.DataTree`, a leaf-or-branch tree (mirroring
     the Rust ``DataTree`` used internally) that also underlies the ``outputs`` argument of
     :func:`~.build` itself, so arbitrarily nested ``list``/``tuple``/``dict``/namedtuple
-    structures of tracers are accepted, not just a single level.
+    structures of tracers are accepted, not just a single level. Finally,
+    :meth:`.Tracer.draw` and :meth:`.QuantumProgram.draw` render a tracer's expression tree,
+    either as text (the default, with shared nodes (fan-out) tagged and expanded only once) or,
+    with ``output="graphviz"``, as a :class:`PIL.Image.Image` graph layout -- one box per node,
+    with edges (wires) labelled by argument name, dtype/shape, and, for a port into a
+    multi-output node, its source path -- which requires the optional Graphviz and Pillow
+    dependencies.
 
     Every operator and reduction method also has a numpy-style standalone-function
     counterpart in :mod:`qiskit.quantum_program`, so ``mean(x, axis=0)`` and ``x.mean(axis=0)``

@@ -21,7 +21,7 @@ is the structure you get back.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 __all__ = ["QuantumProgram"]
 
@@ -57,6 +57,18 @@ class QuantumProgram:
     def _node_labels(self) -> list[str]:
         """The labels of every materialized node, for introspection/testing."""
         return self._graph._node_labels()  # pylint: disable=protected-access
+
+    def draw(self, output: Literal["text", "graphviz"] = "text") -> Any:
+        """Render this program's outputs.
+
+        ``output="text"`` (the default) returns a multi-line string, one expression tree per
+        output. ``output="graphviz"`` instead lays out the underlying node graph as an image
+        (:class:`PIL.Image.Image`) to be viewed rather than printed, and requires the optional
+        Graphviz and Pillow dependencies.
+        """
+        from ._draw import draw_tracers
+
+        return draw_tracers(self._tree, output)
 
     def __repr__(self) -> str:
         return f"QuantumProgram(inputs={self.input_keys()}, outputs={self.output_keys()})"

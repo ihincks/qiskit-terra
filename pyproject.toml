@@ -498,6 +498,7 @@ ignore = [
 "test/benchmarks/*" = ["S101"]
 # Visualization functions often subprocess to visualization tools
 "qiskit/visualization/*" = ["S603", "S607"]
+"qiskit/quantum_program/_draw.py" = ["S603", "S607"]
 
 [tool.coverage.report]
 exclude_also = [

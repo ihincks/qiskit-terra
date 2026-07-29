@@ -32,7 +32,7 @@ is simply never visited.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 
@@ -306,6 +306,20 @@ class Tracer:
     def parity(self, axis: int) -> Tracer:
         """XOR-reduction (parity) of a ``bit`` tensor along ``axis``, removing that axis."""
         return _reduce("parity", self, axis)
+
+    # -- debugging --------------------------------------------------------------------------
+
+    def draw(self, output: Literal["text", "graphviz"] = "text") -> Any:
+        """Render this tracer's expression tree.
+
+        ``output="text"`` (the default) returns a multi-line string. ``output="graphviz"``
+        instead lays out the underlying node graph as an image (:class:`PIL.Image.Image`) to
+        be viewed rather than printed, and requires the optional Graphviz and Pillow
+        dependencies.
+        """
+        from ._draw import draw_tracers
+
+        return draw_tracers(self.__datatree__(), output)
 
     def __repr__(self) -> str:
         if self.is_leaf:

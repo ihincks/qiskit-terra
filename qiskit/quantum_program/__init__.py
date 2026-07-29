@@ -49,6 +49,18 @@ contract: the structure you build with is the structure you get back::
     prog = build(result)            # no wrapping dict needed
     prog.resolve()                  # [{"meas": TensorSpec(bit, [4000, 2])}] -- same shape
 
+Call :meth:`Tracer.draw` or :meth:`QuantumProgram.draw` to render the expression tree, either
+as text (the default, with shared nodes tagged and expanded only once) or, with
+``output="graphviz"``, as a :class:`PIL.Image.Image` graph layout -- one box per node, with
+edges (wires) labelled by argument name, dtype/shape, and, for a port into a multi-output node,
+its source path::
+
+    print(prog.draw())
+    # meas: shot_loop(shots=4000, circuits=1)[0]["meas"] → bit[4000, 2]
+    #    └─ params[0]: input('theta') → f64[1]
+
+    prog.draw(output="graphviz")   # PIL.Image.Image; requires Graphviz and Pillow
+
 Every operator/method on :class:`Tracer` also has a numpy-style standalone-function
 counterpart, so ``mean(x, axis=0)`` and ``x.mean(axis=0)`` (likewise ``add(x, y)``/``x + y``,
 etc.) are interchangeable.

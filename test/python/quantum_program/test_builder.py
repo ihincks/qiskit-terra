@@ -12,6 +12,7 @@
 
 """Tests for the tracer front-end that builds a QuantumProgram."""
 
+import unittest
 from collections import namedtuple
 
 import numpy as np
@@ -43,6 +44,7 @@ from qiskit.quantum_program import (
     subtract,
     var,
 )
+from qiskit.utils import optionals as _optionals
 from test import QiskitTestCase
 
 
@@ -606,3 +608,114 @@ class TestShotLoop(QiskitTestCase):
         self.assertEqual(
             prog.resolve(), {"a": TensorSpec("bit", [10, 1]), "b": TensorSpec("bit", [10, 2])}
         )
+
+
+class TestDraw(QiskitTestCase):
+    """Tests for Tracer.draw() / QuantumProgram.draw()."""
+
+    def test_draw_returns_str(self):
+        """draw() returns an ordinary str (usable with print(), string methods, etc.)."""
+        x = qp_input("x", f64[3])
+        self.assertIsInstance(build({"z": x + 1.0}).draw(), str)
+        self.assertIsInstance((x + 1.0).draw(), str)
+
+    def test_draw_names_each_op_once_and_expands_shared_node_once(self):
+        """A magnetization-style pipeline names each op once, and the shared shot_loop node
+        (fed by the same params[0] for its single output leaf) is expanded exactly once."""
+        theta = Parameter("theta")
+        qc = QuantumCircuit(2)
+        qc.ry(theta, 0)
+        qc.ry(theta, 1)
+        qc.measure_all()
+
+        theta_in = qp_input("theta", f64[1])
+        bits = shot_loop([qc], shots=4000, params=[theta_in])[0]["meas"]
+        magnetization = 1 - 2 * bits.parity(axis=1).mean(axis=0)
+        drawing = build({"magnetization": magnetization}).draw()
+
+        for text in ("subtract", "multiply", "mean(axis=0)", "parity(axis=1)", "shot_loop"):
+            self.assertEqual(drawing.count(text), 1)
+        self.assertEqual(drawing.count("input('theta')"), 1)
+
+    def test_draw_tags_back_reference_for_shared_node(self):
+        """A node used twice is tagged %n, and expanded (its own children rendered) only once
+        -- the shared "add" node's child "constant" appears just once, not twice."""
+        x = qp_input("x", f64[3])
+        w = x + 1.0
+        drawing = build({"z": w * w}).draw()
+        self.assertIn("%1", drawing)
+        self.assertEqual(drawing.count("add"), 2)  # both occurrences show the header line...
+        self.assertEqual(drawing.count("constant"), 1)  # ...but only one is expanded
+
+    def test_draw_rejects_unknown_output(self):
+        """An unrecognized output kind raises ValueError, naming the offending value."""
+        x = qp_input("x", f64[3])
+        with self.assertRaisesRegex(ValueError, "bogus"):
+            (x + 1.0).draw(output="bogus")
+        with self.assertRaisesRegex(ValueError, "bogus"):
+            build({"z": x + 1.0}).draw(output="bogus")
+
+    @unittest.skipUnless(_optionals.HAS_GRAPHVIZ, "Graphviz not installed")
+    @unittest.skipUnless(_optionals.HAS_PIL, "PIL not installed")
+    def test_draw_graphviz_returns_image(self):
+        """output="graphviz" returns a PIL image for both Tracer.draw() and
+        QuantumProgram.draw()."""
+        from PIL.Image import Image
+
+        x = qp_input("x", f64[3])
+        z = x.mean(axis=0)
+        self.assertIsInstance(z.draw(output="graphviz"), Image)
+        self.assertIsInstance(build({"z": z}).draw(output="graphviz"), Image)
+
+    def test_graphviz_node_label_shows_node_type(self):
+        """Each node's dot label names its op type, matching the text renderer's headers."""
+        from qiskit.quantum_program._draw import _node_label
+
+        theta = Parameter("theta")
+        qc = QuantumCircuit(1)
+        qc.ry(theta, 0)
+        qc.measure_all()
+
+        theta_in = qp_input("theta", f64[1])
+        bits = shot_loop([qc], shots=100, params=[theta_in])[0]["meas"]
+
+        self.assertIn("shot_loop", _node_label(bits._node))  # pylint: disable=protected-access
+        self.assertIn(
+            "mean(axis=0)", _node_label(bits.mean(axis=0)._node)
+        )  # pylint: disable=protected-access
+        self.assertEqual(
+            _node_label(theta_in._node), "input('theta')"
+        )  # pylint: disable=protected-access
+
+    def test_graphviz_edge_label_shows_port_name_and_type(self):
+        """An edge's label arrows from its source-side port path to its destination-side
+        argument name -- one, both, or neither may be present -- plus dtype/shape."""
+        from qiskit.quantum_program._draw import _edge_label
+
+        theta = Parameter("theta")
+        qc = QuantumCircuit(1)
+        qc.ry(theta, 0)
+        qc.measure_all()
+
+        theta_in = qp_input("theta", f64[1])
+        bits = shot_loop([qc], shots=100, params=[theta_in])[0]["meas"]
+        x = qp_input("x", f64[3])
+        y = qp_input("y", f64[3])
+
+        # source-only: a multi-output port feeding an op that doesn't name its args.
+        self.assertEqual(_edge_label("parity", 0, bits), "[0]['meas'] → ·\nbit[100, 1]")
+        # dest-only: a plain leaf feeding an op that names its args.
+        self.assertEqual(_edge_label("add", 0, x), "· → x\nf64[3]")
+        self.assertEqual(_edge_label("add", 1, y), "· → y\nf64[3]")
+        # neither: a plain leaf feeding an op that doesn't name its args.
+        self.assertEqual(_edge_label("mean", 0, x), "f64[3]")
+        # both: a multi-output port feeding an op that names its args.
+        self.assertEqual(_edge_label("shot_loop", 0, bits), "[0]['meas'] → params[0]\nbit[100, 1]")
+
+    def test_graphviz_dot_quote_escapes_special_characters(self):
+        """Backslashes, quotes, and newlines are all escaped for the dot string literal."""
+        from qiskit.quantum_program._draw import _dot_quote
+
+        self.assertEqual(_dot_quote('a"b'), '"a\\"b"')
+        self.assertEqual(_dot_quote("a\\b"), '"a\\\\b"')
+        self.assertEqual(_dot_quote("a\nb"), '"a\\nb"')
