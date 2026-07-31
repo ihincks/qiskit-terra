@@ -59,6 +59,11 @@ def _op_display(node: _Node) -> str:
         return "constant"
     if op == "shot_loop":
         return f"shot_loop(shots={node.attrs['shots']}, circuits={len(node.attrs['circuits'])})"
+    if op == "parameter_expressions":
+        return (
+            f"parameter_expressions(expressions={len(node.attrs['expressions'])}, "
+            f"parameters={len(node.attrs['parameters'])})"
+        )
     parts = []
     if node.attrs.get("axis") is not None:
         parts.append(f"axis={node.attrs['axis']}")
@@ -94,6 +99,8 @@ def _arg_label(parent_op: str, index: int) -> str:
         return "x: " if index == 0 else "y: "
     if parent_op == "shot_loop":
         return f"params[{index}]: "
+    if parent_op == "parameter_expressions":
+        return "values: "
     return ""
 
 

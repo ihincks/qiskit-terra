@@ -35,6 +35,7 @@ from qiskit.quantum_program import (
     i64,
     mean,
     multiply,
+    parameter_expressions,
     parity,
     power,
     qp_input,
@@ -610,6 +611,116 @@ class TestShotLoop(QiskitTestCase):
         )
 
 
+class TestParameterExpressions(QiskitTestCase):
+    """Tests for parameter_expressions, which wires in a ParameterExpressions node."""
+
+    def test_spec_inferred_from_declared_parameters(self):
+        """The output's trailing axis is the expression count, the input's the declared
+        parameter count."""
+        theta, phi = Parameter("theta"), Parameter("phi")
+        values = qp_input("values", f64[2])
+        y = parameter_expressions([theta + phi, 2 * theta, phi], values, parameters=[theta, phi])
+        self.assertIsInstance(y, Tracer)
+        self.assertEqual(y.spec, TensorSpec("f64", [3]))
+
+    def test_batch_prefix_preserved(self):
+        """Leading batch axes on the values tensor pass through to the output unchanged."""
+        theta, phi = Parameter("theta"), Parameter("phi")
+        values = qp_input("values", f64[5, 2])
+        y = parameter_expressions([theta * phi], values, parameters=[theta, phi])
+        self.assertEqual(y.spec, TensorSpec("f64", [5, 1]))
+
+    def test_superset_parameters_allowed(self):
+        """parameters may declare more than the expressions reference; the input axis is as
+        wide as the declaration, and the extra values are ignored."""
+        theta, phi, chi = Parameter("theta"), Parameter("phi"), Parameter("chi")
+        values = qp_input("values", f64[3])
+        y = parameter_expressions([2 * phi], values, parameters=[theta, phi, chi])
+        self.assertEqual(y.spec, TensorSpec("f64", [1]))
+
+    def test_no_parameters(self):
+        """A fully bound expression references no parameters, so its input axis is empty."""
+        theta = Parameter("theta")
+        values = qp_input("values", f64[4, 0])
+        y = parameter_expressions([(2 * theta).assign(theta, 1.5)], values, parameters=[])
+        self.assertEqual(y.spec, TensorSpec("f64", [4, 1]))
+
+    def test_undeclared_parameter_raises(self):
+        """Every parameter an expression references must be declared."""
+        theta, phi = Parameter("theta"), Parameter("phi")
+        values = qp_input("values", f64[1])
+        with self.assertRaisesRegex(ValueError, "phi"):
+            parameter_expressions([theta + phi], values, parameters=[theta])
+
+    def test_duplicate_parameter_raises(self):
+        """A parameter declared twice would have an ambiguous input column."""
+        theta = Parameter("theta")
+        values = qp_input("values", f64[2])
+        with self.assertRaisesRegex(ValueError, "theta"):
+            parameter_expressions([theta], values, parameters=[theta, theta])
+
+    def test_wrong_values_shape_raises(self):
+        """The values tensor's trailing axis must match the declared parameter count."""
+        theta, phi = Parameter("theta"), Parameter("phi")
+        values = qp_input("values", f64[3])
+        with self.assertRaises(ValueError):
+            parameter_expressions([theta + phi], values, parameters=[theta, phi])
+
+    def test_wrong_values_dtype_raises(self):
+        """The values tensor must be f64."""
+        theta = Parameter("theta")
+        with self.assertRaises(ValueError):
+            parameter_expressions([theta], qp_input("values", i64[1]), parameters=[theta])
+
+    def test_build_and_resolve_end_to_end(self):
+        """The node materializes under a single label, wired from the values port."""
+        theta, phi = Parameter("theta"), Parameter("phi")
+        values = qp_input("values", f64[10, 2])
+        y = parameter_expressions([theta + phi, theta - phi], values, parameters=[theta, phi])
+        prog = build({"y": y})
+        self.assertEqual(prog._node_labels(), ["__input_values", "parameter_expressions_0"])
+        self.assertEqual(prog.resolve(), {"y": TensorSpec("f64", [10, 2])})
+
+    def test_downstream_arithmetic(self):
+        """The output is an ordinary leaf tracer, so it composes with the math ops."""
+        theta = Parameter("theta")
+        values = qp_input("values", f64[8, 1])
+        y = parameter_expressions([2 * theta], values, parameters=[theta])
+        prog = build({"z": y.mean(axis=0)})
+        self.assertEqual(prog.resolve(), {"z": TensorSpec("f64", [1])})
+
+    def test_feeds_shot_loop_params(self):
+        """A parameter_expressions output can supply a circuit's parameter values."""
+        theta = Parameter("theta")
+        qc = QuantumCircuit(2)
+        qc.ry(theta, [0, 1])
+        qc.measure_all()
+
+        # The program is given a raw angle, and doubles it before running the circuit.
+        raw = qp_input("raw", f64[10, 1])
+        angles = parameter_expressions([2 * theta], raw, parameters=[theta])
+        bits = shot_loop([qc], shots=100, params=[angles])[0]["meas"]
+        self.assertEqual(bits.shape, [10, 100, 2])
+
+        prog = build({"magnetization": 1 - 2 * bits.parity(axis=2).mean(axis=1)})
+        self.assertEqual(
+            [label for label in prog._node_labels() if label.startswith("parameter")],
+            ["parameter_expressions_0"],
+        )
+        self.assertEqual(prog.resolve(), {"magnetization": TensorSpec("f64", [10])})
+
+    def test_shared_node_is_materialized_once(self):
+        """Referencing the same tracer twice collapses to a single node at build."""
+        theta = Parameter("theta")
+        values = qp_input("values", f64[1])
+        y = parameter_expressions([theta], values, parameters=[theta])
+        prog = build({"a": y, "b": y * 2.0})
+        self.assertEqual(
+            [label for label in prog._node_labels() if label.startswith("parameter")],
+            ["parameter_expressions_0"],
+        )
+
+
 class TestDraw(QiskitTestCase):
     """Tests for Tracer.draw() / QuantumProgram.draw()."""
 
@@ -636,6 +747,16 @@ class TestDraw(QiskitTestCase):
         for text in ("subtract", "multiply", "mean(axis=0)", "parity(axis=1)", "shot_loop"):
             self.assertEqual(drawing.count(text), 1)
         self.assertEqual(drawing.count("input('theta')"), 1)
+
+    def test_draw_shows_parameter_expressions_counts_and_values_wire(self):
+        """A parameter_expressions node shows its expression/parameter counts, and its single
+        input wire is labelled "values"."""
+        theta, phi = Parameter("theta"), Parameter("phi")
+        values = qp_input("values", f64[2])
+        y = parameter_expressions([theta + phi], values, parameters=[theta, phi])
+        drawing = y.draw()
+        self.assertIn("parameter_expressions(expressions=1, parameters=2)", drawing)
+        self.assertIn("values: input('values')", drawing)
 
     def test_draw_tags_back_reference_for_shared_node(self):
         """A node used twice is tagged %n, and expanded (its own children rendered) only once

@@ -39,6 +39,7 @@ import numpy as np
 from qiskit._accelerate.quantum_program import (
     QuantumProgram as _RustQuantumProgram,
     infer_op,
+    infer_parameter_expressions,
     infer_shot_loop,
     spec_of_array,
 )
@@ -58,6 +59,7 @@ __all__ = [
     "divide",
     "mean",
     "multiply",
+    "parameter_expressions",
     "parity",
     "power",
     "qp_input",
@@ -486,6 +488,36 @@ def shot_loop(
     return Tracer(node, [], DataTree.from_python(per_circuit))
 
 
+def parameter_expressions(
+    expressions: Sequence[ParameterExpression],
+    values: Operand,
+    parameters: Sequence[Parameter],
+) -> Tracer:
+    """Numerically evaluate each of ``expressions`` over a batch of parameter ``values``.
+
+    ``values`` must be an ``f64`` tensor of shape ``[..., len(parameters)]``: the trailing axis
+    carries a value for each of ``parameters``, in that order, and any leading axes form an
+    opaque batch prefix specifying how many parameter sets to evaluate.
+
+    ``parameters`` must declare every :class:`.Parameter` referenced by ``expressions``, but may
+    also declare extras -- e.g. a whole circuit's :attr:`~.QuantumCircuit.parameters` when an
+    individual expression uses only some of them -- whose values are then ignored.
+
+    Returns a leaf :class:`Tracer` of shape ``[..., len(expressions)]``, its batch prefix that of
+    ``values`` and its trailing axis holding each expression's value, in the order given.
+    """
+    expressions = list(expressions)
+    parameters = list(parameters)
+    values = _as_tracer(values)
+    spec = infer_parameter_expressions(expressions, parameters, values.spec)
+    node = _Node(
+        "parameter_expressions",
+        (values,),
+        {"expressions": expressions, "parameters": parameters},
+    )
+    return _leaf(node, spec)
+
+
 # ------------------------------------------------------------------------------------------
 # build
 # ------------------------------------------------------------------------------------------
@@ -562,6 +594,13 @@ def build(outputs: Outputs) -> QuantumProgram:
             program._add_shot_loop(label, node.attrs["circuits"], node.attrs["shots"])
             for index, (from_label, from_path) in enumerate(param_ports):
                 program._add_edge(from_label, from_path, label, [index])
+        elif op == "parameter_expressions":
+            values_port = port_of(node.args[0])
+            label = fresh_label("parameter_expressions")
+            program._add_parameter_expressions(
+                label, node.attrs["expressions"], node.attrs["parameters"]
+            )
+            program._add_edge(values_port[0], values_port[1], label, [])
         elif op in _BINARY:
             lhs_port = port_of(node.args[0])
             rhs_port = port_of(node.args[1])
@@ -592,7 +631,7 @@ if TYPE_CHECKING:
 
     from numpy.typing import ArrayLike
 
-    from qiskit.circuit import QuantumCircuit
+    from qiskit.circuit import Parameter, ParameterExpression, QuantumCircuit
     from qiskit._accelerate.quantum_program import TensorSpec
 
     # An inferred tensor shape: fixed dims (``int``) and/or named symbolic dims (``str``).

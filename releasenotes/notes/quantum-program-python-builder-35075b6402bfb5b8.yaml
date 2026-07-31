@@ -52,6 +52,25 @@ features_misc:
         magnetization = 1 - 2 * bits.parity(axis=1).mean(axis=0)
         build({"magnetization": magnetization}).resolve()  # {"magnetization": TensorSpec(f64, [])}
 
+    Parameter values need not be supplied ready-made:
+    :func:`~qiskit.quantum_program.parameter_expressions` adds a node that numerically evaluates
+    a list of :class:`.ParameterExpression` objects over a batch of values for the parameters
+    they reference, which is the natural way to feed :func:`~.shot_loop`'s ``params``. The caller
+    declares which parameter each column of the input tensor carries, so the input's trailing
+    axis has size ``len(parameters)`` and the output's has size ``len(expressions)``, with any
+    leading batch axes passed through unchanged. ``parameters`` must cover every parameter the
+    expressions reference, but may declare extras -- e.g. a whole circuit's
+    :attr:`~.QuantumCircuit.parameters` when an individual expression uses only some of them --
+    whose values are then ignored. For example::
+
+        from qiskit.circuit import Parameter
+        from qiskit.quantum_program import f64, parameter_expressions, qp_input
+
+        theta = Parameter("theta")
+        raw = qp_input("raw", f64[10, 1])
+        angles = parameter_expressions([2 * theta], raw, parameters=[theta])
+        angles.spec  # TensorSpec(f64, [10, 1])
+
     :func:`~qiskit.quantum_program.build` and :meth:`.QuantumProgram.resolve` honor a
     round-trip contract -- the structure you build with is the structure you get back -- so a
     :func:`~.shot_loop` result can be passed to :func:`~.build` directly, with no wrapping

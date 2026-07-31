@@ -13,6 +13,7 @@
 mod data_tree;
 mod input;
 pub mod math_nodes;
+mod parameter_expressions;
 mod program_node;
 #[cfg(feature = "python")]
 pub mod python;
@@ -23,6 +24,9 @@ pub mod tensor;
 
 pub use data_tree::{ArityMismatch, DataTree, PathEntry, TreeMatchError};
 pub use input::Input;
+pub use parameter_expressions::{
+    ParameterExpressions, ParameterExpressionsBuildError, ParameterExpressionsError,
+};
 pub use program_node::{CallError, CallInputError, MissingCallError, ProgramNode, ProgramNodeExt};
 pub use quantum_program::{
     BoxedNodeError, ContractedProgram, ContractionError, OwnedPath, OwnedPathEntry, Port,

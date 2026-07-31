@@ -49,6 +49,15 @@ contract: the structure you build with is the structure you get back::
     prog = build(result)            # no wrapping dict needed
     prog.resolve()                  # [{"meas": TensorSpec(bit, [4000, 2])}] -- same shape
 
+Parameter values can be computed inside the program rather than supplied ready-made:
+:func:`parameter_expressions` adds a node that numerically evaluates a list of
+:class:`.ParameterExpression` objects over a batch of values for the parameters they reference,
+which is the natural way to feed :func:`shot_loop`'s ``params``::
+
+    theta = Parameter("theta")
+    x = qp_input("x", f64[10, 1])
+    angles = parameter_expressions([2 * theta], x, parameters=[theta])  # f64[10, 1]
+
 Call :meth:`Tracer.draw` or :meth:`QuantumProgram.draw` to render the expression tree, either
 as text (the default, with shared nodes tagged and expanded only once) or, with
 ``output="graphviz"``, as a :class:`PIL.Image.Image` graph layout -- one box per node, with
@@ -74,6 +83,7 @@ Functions
    qp_input
    constant
    shot_loop
+   parameter_expressions
    build
    add
    subtract
@@ -118,6 +128,7 @@ from ._tracer import (
     divide,
     mean,
     multiply,
+    parameter_expressions,
     parity,
     power,
     qp_input,
@@ -153,6 +164,7 @@ __all__ = [
     "i64",
     "mean",
     "multiply",
+    "parameter_expressions",
     "parity",
     "power",
     "qp_input",

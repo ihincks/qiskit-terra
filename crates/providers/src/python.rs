@@ -38,6 +38,7 @@ use crate::math_nodes::{
     Add, BitwiseAnd, BitwiseNot, BitwiseOr, BitwiseXor, Divide, Mean, Multiply, Parity, Power,
     Remainder, Std, Subtract, Variance,
 };
+use crate::parameter_expressions::ParameterExpressions;
 use crate::program_node::ProgramNode;
 use crate::quantum_program::{OwnedPath, OwnedPathEntry, Port, QuantumProgram};
 use crate::shot_loop::ShotLoop;
@@ -50,6 +51,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use pyo3::wrap_pyfunction;
 use qiskit_circuit::converters::QuantumCircuitData;
+use qiskit_circuit::parameter::parameter_expression::PyParameterExpression;
+use qiskit_circuit::parameter::symbol_expr::Symbol;
 
 /// Map any `Display`-able error into a Python `ValueError`.
 fn to_py_err<E: std::fmt::Display>(e: E) -> PyErr {
@@ -392,6 +395,39 @@ fn infer_shot_loop<'py>(
         .collect()
 }
 
+/// Build a [`ParameterExpressions`] node evaluating `expressions` from input values given for
+/// `parameters`, in that order.
+///
+/// This is the single source of truth for turning Python-space arguments into the node, shared
+/// by [`infer_parameter_expressions`] (the abstract-eval path) and
+/// [`PyQuantumProgram::_add_parameter_expressions`] (the graph-building path), so the two can't
+/// drift — the same role the [`with_math_node`] macro plays for the math ops.
+fn make_parameter_expressions(
+    expressions: Vec<PyParameterExpression>,
+    parameters: Vec<Symbol>,
+) -> PyResult<ParameterExpressions> {
+    ParameterExpressions::new(
+        expressions.into_iter().map(|p| p.inner).collect(),
+        parameters,
+    )
+    .map_err(to_py_err)
+}
+
+/// Abstract-eval a `ParameterExpressions` node from its input spec (an `[..., N]`-shaped
+/// batch of values for the `N` declared `parameters`). Returns the single resolved output spec
+/// (`[..., M]`, `M` the number of expressions), with no graph constructed.
+#[pyfunction]
+fn infer_parameter_expressions(
+    expressions: Vec<PyParameterExpression>,
+    parameters: Vec<Symbol>,
+    spec: &Bound<'_, PyTensorSpec>,
+) -> PyResult<PyTensorSpec> {
+    let resolved = make_parameter_expressions(expressions, parameters)?
+        .resolve_types_flat(&[spec.borrow().to_tensor_type()])
+        .map_err(to_py_err)?;
+    tensor_type_to_spec(&resolved[0])
+}
+
 /// Infer the [`PyTensorSpec`] of a numpy array-like value (as wired in by `constant`).
 ///
 /// Single-sources the dtype/shape inference used for constants: `np.asarray` → [`Tensor`]
@@ -476,6 +512,18 @@ impl PyQuantumProgram {
         self.inner
             .add_node(label, ShotLoop::new(circuit_data, shots))
             .map_err(to_py_err)
+    }
+
+    /// Add a `ParameterExpressions` node under `label` that evaluates `expressions` from input
+    /// values given for `parameters`, in that order.
+    fn _add_parameter_expressions(
+        &mut self,
+        label: &str,
+        expressions: Vec<PyParameterExpression>,
+        parameters: Vec<Symbol>,
+    ) -> PyResult<()> {
+        let node = make_parameter_expressions(expressions, parameters)?;
+        self.inner.add_node(label, node).map_err(to_py_err)
     }
 
     /// Add a directed edge from one node's output port to another's input port. Ports are
@@ -568,6 +616,7 @@ pub fn quantum_program(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTensorSpec>()?;
     m.add_wrapped(wrap_pyfunction!(infer_op))?;
     m.add_wrapped(wrap_pyfunction!(infer_shot_loop))?;
+    m.add_wrapped(wrap_pyfunction!(infer_parameter_expressions))?;
     m.add_wrapped(wrap_pyfunction!(spec_of_array))?;
     Ok(())
 }
