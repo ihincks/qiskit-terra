@@ -18,6 +18,7 @@ use std::sync::Arc;
 use qiskit_circuit::circuit_data::CircuitData;
 use thiserror::Error;
 
+use super::inference::{float, leading_axes};
 use super::{OpNodeType, QISKIT};
 use crate::data_tree::{DataTree, InvalidName};
 use crate::tensor::{DType, Dim, Tensor, TensorType};
@@ -102,12 +103,15 @@ impl OpNodeType for ShotLoop {
         let mut outputs = Vec::with_capacity(self.output_structure.leaf_count());
         for (index, (circuit, operand)) in self.circuits.iter().zip(inputs).enumerate() {
             let parameters = circuit.num_parameters();
-            let batch =
-                leading_axes(parameters, operand).ok_or_else(|| ShotLoopError::ParameterType {
-                    circuit: index,
-                    parameters,
-                    actual: operand.clone(),
-                })?;
+            let refuse = || ShotLoopError::ParameterType {
+                circuit: index,
+                parameters,
+                actual: operand.clone(),
+            };
+            if !float(operand.dtype) {
+                return Err(refuse());
+            }
+            let batch = leading_axes(&operand.shape, parameters).ok_or_else(refuse)?;
             for register in circuit.cregs() {
                 let mut shape = batch.to_vec();
                 shape.push(Dim::Fixed(self.shots));
@@ -122,15 +126,6 @@ impl OpNodeType for ShotLoop {
     }
     fn eval(&self, _args: &[Tensor]) -> Result<Vec<Tensor>, Self::Error> {
         Err(ShotLoopError::NoBuiltinEval)
-    }
-}
-
-/// Strip out the leading axes, assuming the last axis matches the number of parameters.
-fn leading_axes(parameters: usize, operand: &TensorType) -> Option<&[Dim]> {
-    let float = matches!(operand.dtype, DType::F32 | DType::F64);
-    match operand.shape.split_last() {
-        Some((&Dim::Fixed(values), batch)) if float && values == parameters => Some(batch),
-        _ => None,
     }
 }
 
@@ -328,17 +323,9 @@ mod test {
                 .to_string(),
             "circuit 1: expected a floating-point tensor of shape [..., 2], got F64[3]"
         );
-        // A dtype that is not floating point, a rank too low to carry a parameter axis, and a
-        // parameter axis whose size is not known are each refused the same way.
-        for operand in [
-            ty(DType::I64, &[2]),
-            ty(DType::Bit, &[2]),
-            ty(DType::F64, &[]),
-            TensorType {
-                dtype: DType::F64,
-                shape: vec![Dim::Bounded { max: 2 }],
-            },
-        ] {
+        // A dtype that is not floating point is refused the same way as a parameter axis of the
+        // wrong length.
+        for operand in [ty(DType::I64, &[2]), ty(DType::Bit, &[2])] {
             assert_eq!(
                 node.infer_output_types(&[ok.clone(), operand.clone()])
                     .unwrap_err(),
