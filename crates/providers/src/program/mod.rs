@@ -13,9 +13,11 @@
 //! A whole computation: the dataflow graphs it is made of, and the entry point a caller reaches it
 //! through.
 
+mod contraction;
 mod program_function;
 mod quantum_program;
 
+pub use contraction::{ContractionError, contract};
 pub use program_function::{
     FunctionError, FunctionEvalError, NodeId, NodeRef, NodeRole, NodeView, ProgramFunction,
     Signature, Value,

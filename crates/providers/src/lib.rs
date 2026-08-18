@@ -22,7 +22,8 @@
 //! - [`program`] holds [`QuantumProgram`], a whole computation, and the [`ProgramFunction`]s it is
 //!   made of, each of which is one dataflow graph. Nodes are the only entity a function holds: a
 //!   [`Value`] is an output slot of the node producing it, and a function's parameters and results
-//!   are nodes too, so every value has a producer.
+//!   are nodes too, so every value has a producer. [`contract`] groups a program's nodes into one
+//!   function per execution resource, for an implementation that needs its dispatch worked out.
 //! - [`data_tree`] holds [`DataTree`], the container for structured values. A program's inputs and
 //!   outputs arrive in one, arranged by the structures it declares, which is where all naming lives.
 
@@ -34,6 +35,7 @@ pub mod tensor;
 pub use data_tree::{ArityMismatch, DataTree, InvalidName, Name, PathEntry, TreeMatchError};
 pub use nodes::{BoxedOpNodeError, BoxedOpNodeType, Constant, ErasedOpNodeType, OpNodeType};
 pub use program::{
-    FunctionError, FunctionEvalError, FunctionId, NodeId, NodeRef, NodeRole, NodeView,
-    ProgramError, ProgramEvalError, ProgramFunction, QuantumProgram, Signature, Value,
+    ContractionError, FunctionError, FunctionEvalError, FunctionId, NodeId, NodeRef, NodeRole,
+    NodeView, ProgramError, ProgramEvalError, ProgramFunction, QuantumProgram, Signature, Value,
+    contract,
 };
