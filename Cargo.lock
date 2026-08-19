@@ -2416,6 +2416,7 @@ dependencies = [
  "ndarray",
  "num-complex",
  "num-traits",
+ "numpy",
  "pyo3",
  "qiskit-circuit",
  "rustworkx-core",

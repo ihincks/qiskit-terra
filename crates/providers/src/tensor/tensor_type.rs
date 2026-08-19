@@ -60,6 +60,17 @@ pub(super) fn fmt_shape(shape: &[Dim]) -> String {
 }
 
 /// A specification of a tensor without any data.
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        name = "TensorType",
+        module = "qiskit.quantum_program",
+        eq,
+        frozen,
+        from_py_object,
+        hash
+    )
+)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TensorType {
     /// The element type of the tensor.

@@ -15,6 +15,22 @@
 use std::fmt;
 
 /// The possible data types for a Tensor.
+///
+/// From Python, indexing a dtype with a shape gives a tensor type: ``DType.F64[3, 4]`` is a 3x4
+/// matrix of 64-bit floats and ``DType.F64[()]`` is a scalar. An axis is sized by an integer, or by
+/// ``bounded()`` where its size is known only at run time.
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        name = "DType",
+        module = "qiskit.quantum_program",
+        eq,
+        eq_int,
+        frozen,
+        from_py_object,
+        hash
+    )
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DType {
     C128, // complex
