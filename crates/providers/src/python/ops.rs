@@ -17,14 +17,22 @@
 //! the author of a program and the reader of one.
 
 use pyo3::PyClass;
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyTypeError, PyValueError};
+use pyo3::intern;
 use pyo3::prelude::*;
+use qiskit_circuit::circuit_data::{CircuitData, PyCircuitData};
+use qiskit_circuit::parameter::parameter_expression::{PyParameter, PyParameterExpression};
+use qiskit_circuit::parameter::symbol_expr::Symbol;
 
-use super::chain;
+use super::data_tree::{ObjectTree, PyDataTree};
 use super::tensor::{parse_shape, tensor};
+use super::{chain, value_error};
+use crate::InvalidName;
+use crate::data_tree::DataTree;
 use crate::ops::{
-    Add, BitwiseAnd, BitwiseNot, BitwiseOr, BitwiseXor, BoxedProgramOp, BroadcastTo, Cast,
-    Constant, Divide, Mean, Multiply, Parity, Power, ProgramOp, Remainder, Std, Subtract, Variance,
+    Add, BindParameters, BitwiseAnd, BitwiseNot, BitwiseOr, BitwiseXor, BoxedProgramOp,
+    BroadcastTo, Cast, Constant, Divide, Mean, Multiply, Parity, Power, ProgramOp, Remainder,
+    ShotLoop, Std, Subtract, Variance,
 };
 use crate::tensor::{DType, TensorType};
 
@@ -45,6 +53,37 @@ pub struct PyProgramOp {
     pub(super) op: BoxedProgramOp,
 }
 
+impl PyProgramOp {
+    /// Arrange `values`, one per result this operation produces, as it arranges its results.
+    ///
+    /// A shot loop is the one operation that arranges its results, and it says how. One result is a
+    /// leaf, and several are a sequence.
+    fn arrange(&self, values: Vec<Py<PyAny>>) -> Result<ObjectTree, InvalidName> {
+        if let Some(shot_loop) = self.op.downcast_ref::<ShotLoop>() {
+            let mut values = values.into_iter();
+            let circuit_outputs = shot_loop
+                .circuits()
+                .iter()
+                .map(|circuit| {
+                    DataTree::mapping(circuit.cregs().iter().map(|creg| {
+                        let value = values
+                            .next()
+                            .expect("one value per register of each circuit");
+                        (creg.name(), DataTree::new_leaf(value))
+                    }))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(DataTree::sequence(circuit_outputs));
+        }
+        match <[Py<PyAny>; 1]>::try_from(values) {
+            Ok([value]) => Ok(DataTree::new_leaf(value)),
+            Err(values) => Ok(DataTree::sequence(
+                values.into_iter().map(DataTree::new_leaf),
+            )),
+        }
+    }
+}
+
 #[pymethods]
 impl PyProgramOp {
     /// The type name, qualified by its namespace.
@@ -53,19 +92,21 @@ impl PyProgramOp {
         self.op.full_name()
     }
 
-    /// The types this operation produces from operands of type ``operands``.
+    /// Return the types this operation produces from operands of type ``operands``, arranged as it
+    /// produces them.
     ///
     /// Args:
     ///     operands: The type of each operand, one per operand the operation takes.
     ///
     /// Returns:
-    ///     One type per value the operation produces.
+    ///     A data tree of the types produced, which is one leaf for an operation producing one
+    ///     value.
     ///
     /// Raises:
     ///     ValueError: If there is not one type per operand, or if the operation does not accept the
     ///         types given.
     #[pyo3(signature = (operands, /))]
-    fn output_types(&self, operands: Vec<TensorType>) -> PyResult<Vec<TensorType>> {
+    fn output_types(&self, py: Python<'_>, operands: Vec<TensorType>) -> PyResult<PyDataTree> {
         let arity = self.op.arity();
         if operands.len() != arity {
             return Err(PyValueError::new_err(format!(
@@ -74,9 +115,15 @@ impl PyProgramOp {
                 operands.len()
             )));
         }
-        self.op.infer_output_types(&operands).map_err(|error| {
+        let types = self.op.infer_output_types(&operands).map_err(|error| {
             PyValueError::new_err(format!("{}: {}", self.op.full_name(), chain(&*error)))
-        })
+        })?;
+        let types = types
+            .into_iter()
+            .map(|ty| Ok(Py::new(py, ty)?.into_any()))
+            .collect::<PyResult<Vec<_>>>()?;
+        let types = self.arrange(types).map_err(|error| value_error(&error))?;
+        Ok(PyDataTree(types))
     }
 }
 
@@ -349,3 +396,100 @@ impl PyConstant {
         Ok(init(Constant::new(tensor(value)?), Self))
     }
 }
+
+/// Run each of several circuits for a number of shots, over the values given for its parameters.
+///
+/// The operation takes one operand per circuit, holding that circuit's parameter values in its
+/// trailing axis, and produces one result per classical register of each circuit, ordered by circuit
+/// and then by register.
+///
+/// Args:
+///     circuits: The circuits to run, each copied as it is wired in.
+///     shots: How many shots to run each circuit for.
+///
+/// Raises:
+///     TypeError: If an entry of ``circuits`` is not a circuit.
+///     ValueError: If a register's name cannot name a value.
+#[pyclass(
+    name = "ShotLoop",
+    module = "qiskit.quantum_program.ops",
+    extends = PyProgramOp,
+    frozen
+)]
+pub struct PyShotLoop;
+
+#[pymethods]
+impl PyShotLoop {
+    #[new]
+    #[pyo3(signature = (circuits, shots, /))]
+    fn new(circuits: Vec<Bound<'_, PyAny>>, shots: usize) -> PyResult<PyClassInitializer<Self>> {
+        let circuits = circuits
+            .iter()
+            .enumerate()
+            .map(|(index, circuit)| {
+                let py = circuit.py();
+                let data = circuit
+                    .getattr(intern!(py, "data"))
+                    .and_then(|_| circuit.getattr(intern!(py, "_data")))
+                    .ok()
+                    .and_then(|data| data.cast_into::<PyCircuitData>().ok());
+                let Some(data) = data else {
+                    return Err(PyTypeError::new_err(format!(
+                        "circuit {index}: expected a QuantumCircuit, got {}",
+                        circuit.get_type().name()?
+                    )));
+                };
+                Ok(CircuitData::clone(&data.borrow()))
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let op = ShotLoop::new(circuits, shots).map_err(|error| value_error(&error))?;
+        Ok(init(op, Self))
+    }
+}
+
+/// Evaluate each of several parameter expressions over a batch of values for some parameters.
+///
+/// The operation takes one operand, holding one value per declared parameter in its trailing axis,
+/// and produces one result holding each expression's value in its trailing axis. Expressions
+/// evaluate in double precision, so the result is ``f64``.
+///
+/// Args:
+///     expressions: The expressions to evaluate.
+///     parameters: The parameters the values are for. Every parameter an expression references must
+///         appear here, and surplus ones are ignored.
+///
+/// Raises:
+///     ValueError: If an expression references a parameter ``parameters`` does not name.
+#[pyclass(
+    name = "BindParameters",
+    module = "qiskit.quantum_program.ops",
+    extends = PyProgramOp,
+    frozen
+)]
+pub struct PyBindParameters;
+
+#[pymethods]
+impl PyBindParameters {
+    #[new]
+    #[pyo3(signature = (expressions, parameters, /))]
+    fn new(
+        expressions: Vec<Bound<'_, PyAny>>,
+        parameters: Vec<PyParameter>,
+    ) -> PyResult<PyClassInitializer<Self>> {
+        let expressions = expressions
+            .iter()
+            .map(|expression| {
+                PyParameterExpression::extract_coerce(expression.as_borrowed())
+                    .map(|expression| expression.inner)
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let parameters = parameters
+            .iter()
+            .map(|parameter| Symbol::clone(&parameter.0))
+            .collect();
+        let op =
+            BindParameters::new(expressions, parameters).map_err(|error| value_error(&error))?;
+        Ok(init(op, Self))
+    }
+}
+

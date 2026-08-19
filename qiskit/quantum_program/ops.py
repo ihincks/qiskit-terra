@@ -62,10 +62,13 @@ Classes
    Cast
    BroadcastTo
    Constant
+   ShotLoop
+   BindParameters
 """
 
 from qiskit._accelerate.quantum_program import (
     Add,
+    BindParameters,
     BitwiseAnd,
     BitwiseNot,
     BitwiseOr,
@@ -80,6 +83,7 @@ from qiskit._accelerate.quantum_program import (
     Power,
     ProgramOp,
     Remainder,
+    ShotLoop,
     Std,
     Subtract,
     Variance,
@@ -87,6 +91,7 @@ from qiskit._accelerate.quantum_program import (
 
 __all__ = [
     "Add",
+    "BindParameters",
     "BitwiseAnd",
     "BitwiseNot",
     "BitwiseOr",
@@ -101,6 +106,7 @@ __all__ = [
     "Power",
     "ProgramOp",
     "Remainder",
+    "ShotLoop",
     "Std",
     "Subtract",
     "Variance",

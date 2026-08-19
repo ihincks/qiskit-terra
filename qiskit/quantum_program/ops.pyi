@@ -23,6 +23,7 @@ from qiskit.quantum_program import DataTree, DType, TensorType, bounded
 
 __all__ = [
     "Add",
+    "BindParameters",
     "BitwiseAnd",
     "BitwiseNot",
     "BitwiseOr",
@@ -37,6 +38,7 @@ __all__ = [
     "Power",
     "ProgramOp",
     "Remainder",
+    "ShotLoop",
     "Std",
     "Subtract",
     "Variance",
@@ -137,7 +139,21 @@ class Constant(ProgramOp):
 
     def __init__(self, value: ArrayLike, /) -> None: ...
 
+class ShotLoop(ProgramOp):
+    """Run each of several circuits for a number of shots."""
+
+    def __init__(self, circuits: Sequence[QuantumCircuit], shots: int, /) -> None: ...
+
+class BindParameters(ProgramOp):
+    """Evaluate each of several parameter expressions over a batch of values."""
+
+    def __init__(
+        self, expressions: Sequence[ParameterExpression], parameters: Sequence[Parameter], /
+    ) -> None: ...
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from numpy.typing import ArrayLike
+
+    from qiskit.circuit import Parameter, ParameterExpression, QuantumCircuit

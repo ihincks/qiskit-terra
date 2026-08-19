@@ -23,9 +23,9 @@ use pyo3::prelude::*;
 use crate::tensor::{DType, TensorType};
 pub use data_tree::PyDataTree;
 use ops::{
-    PyAdd, PyBitwiseAnd, PyBitwiseNot, PyBitwiseOr, PyBitwiseXor, PyBroadcastTo, PyCast,
-    PyConstant, PyDivide, PyMean, PyMultiply, PyParity, PyPower, PyProgramOp, PyRemainder, PyStd,
-    PySubtract, PyVariance,
+    PyAdd, PyBindParameters, PyBitwiseAnd, PyBitwiseNot, PyBitwiseOr, PyBitwiseXor, PyBroadcastTo,
+    PyCast, PyConstant, PyDivide, PyMean, PyMultiply, PyParity, PyPower, PyProgramOp, PyRemainder,
+    PyShotLoop, PyStd, PySubtract, PyVariance,
 };
 use program::{PyFunctionBuilder, PyQuantumProgram, PyValue};
 use tensor::PyBounded;
@@ -61,6 +61,7 @@ pub fn quantum_program(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // The op catalogue, whose base class must be registered before the classes extending it.
     m.add_class::<PyProgramOp>()?;
     m.add_class::<PyAdd>()?;
+    m.add_class::<PyBindParameters>()?;
     m.add_class::<PyBitwiseAnd>()?;
     m.add_class::<PyBitwiseNot>()?;
     m.add_class::<PyBitwiseOr>()?;
@@ -74,6 +75,7 @@ pub fn quantum_program(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyParity>()?;
     m.add_class::<PyPower>()?;
     m.add_class::<PyRemainder>()?;
+    m.add_class::<PyShotLoop>()?;
     m.add_class::<PyStd>()?;
     m.add_class::<PySubtract>()?;
     m.add_class::<PyVariance>()?;
