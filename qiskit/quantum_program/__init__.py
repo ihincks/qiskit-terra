@@ -17,35 +17,103 @@ Quantum programs (:mod:`qiskit.quantum_program`)
 
 .. currentmodule:: qiskit.quantum_program
 
-A quantum program describes a hybrid quantum-classical computation as typed tensor values
-produced and consumed by nodes. It is inert data: it describes a computation without
-performing one.
+A quantum program describes a quantum-centric computation. The heart of such a computation is a
+shot loop, which can optionally be prefixed or suffixed with classical operations that prepare
+input parameter values for the circuits in the shot loop, or post-process samples collected
+from running the shot loop. A quantum program is itself an inert structure: it describes a
+computation without performing one.
 
-A program's inputs and outputs travel in a data tree, arranged by the structures the program
-declares, which is where all naming lives.
+All data processing inside of a quantum program is tensor based. A quantum program is a data flow
+of tensors. Quantum work is therefore structured as an operation that maps tensors of parameter
+value data to bit-valued arrays of output data via quantum circuits. Examples of pre-processing
+include tasks like randomizing circuit paramaters. Examples of post-processing include tasks like
+computing expectation values or performing post-selection. Quantum programs do not contain
+control flow; they are not intended to be used to orchestrate closed loop experiments like VQE.
+Instead, they aim to capture the semantics of out-of-coherence operations that have the potential
+to reduce the amount of data traveling to and from the Quantum Computer by formatting it in the
+precise way that an experiment requires.
+
+A program's inputs and outputs are expressed as a data tree with tensor-valued leaves. The
+tree structure is user specified.
 
 Writing a program
 =================
 
-:func:`qp_input` declares a typed input and returns a :class:`Tracer`, which the arithmetic
-operators, the bitwise operators and the reductions build on. Each operation reports the type it
-produces as it is written, so a dtype or shape mistake is raised at the line that made it::
+A :func:`shot_loop` creates a node that is the core quantum execution unit. It holds a list of
+quantum circuits and a shot count, and represents a directive to sample classical register
+values from each circuit for that number of shots::
 
-    from qiskit.quantum_program import build, f64, qp_input
+    from qiskit.circuit import QuantumCircuit
+    from qiskit.quantum_program import build, shot_loop
 
-    x = qp_input("x", f64[3])
-    y = (x * x).mean(axis=0)
-    y.type                        # TensorType(F64[])
+    circuit = QuantumCircuit(5)
+    circuit.h(0)
+    circuit.measure_all()
 
-:func:`build` names the outputs, with whatever nesting they should come back in, and gives the
-program. Calling it takes one keyword argument per declared input::
+    outcomes = shot_loop([circuit], shots=1024)
+    outcomes[0]["meas"].type      # TensorType(Bit[1024, 5])
 
-    program = build({"z": y})
-    program.output_types()        # DataTree([z: TensorType(F64[])])
-    program(x=[1.0, 2.0, 3.0])    # DataTree([z: array(4.66666667)])
+A shot loop produces one value per classical register of each circuit, addressed by circuit and
+register name. Each is a :class:`Tracer`, which stands for a value the program will produce rather
+than one in hand. The arithmetic operators, the bitwise operators and the reductions all build
+another tracer, so post-processing is written as ordinary arithmetic, and each operation reports the
+type it produces as it is written, so a dtype or shape mistake is raised at the line that made it::
+
+    excited = outcomes[0]["meas"].mean(axis=0)
+    excited.type                  # TensorType(F64[5])
+
+A tracer records an expression and nothing else. :func:`build` names the outputs, with whatever
+nesting they should come back in, and gives the program::
+
+    program = build({"excited": excited, "samples": outcomes})
+    program.output_types()
+    # DataTree([excited: TensorType(F64[5]), samples: [[meas: TensorType(Bit[1024, 5])]]])
 
 Only the expressions the declared outputs reach are built, so a value used twice becomes one node
 and a value nothing uses costs nothing.
+
+Circuit parameters
+==================
+
+When a circuit is parametric, it requires a tensor input whose last axis matches the number of
+parameters, in the order :attr:`.QuantumCircuit.parameters` gives them, and whose leading axes
+result in a sweep over parameter value sets. In this case, the output tensor for some classical
+register of the circuit has shape ``(*leading_axes, shots, creg_size)``, i.e. the same number of
+shots are collected for every parametric configuration of the circuit::
+
+    from qiskit.circuit import Parameter, QuantumCircuit
+    from qiskit.quantum_program import f64, qp_input, shot_loop
+
+    circuit1 = QuantumCircuit(2, 2)
+    circuit1.measure([0, 1], [0, 1])
+
+    circuit2 = QuantumCircuit(2, 2)
+    circuit2.rx(Parameter("phi"), 0)
+    circuit2.rx(Parameter("theta"), 1)
+    circuit2.measure([0, 1], [0, 1])
+
+    angles = qp_input("angles", f64[16, 2])
+    outcomes = shot_loop([circuit1, circuit2], shots=1024, parameter_values=[None, angles])
+    outcomes[1]["c"].type         # TensorType(Bit[16, 1024, 2])
+
+In the above, supplying ``None`` as the parameter value array is equivalent to supplying an empty
+constant array.
+
+:func:`qp_input` declares a typed input, supplied when the program is called, so ``angles`` is
+whatever the caller passes. The program input ``angles`` could also be replaced, for example, by a
+constant array ``np.linspace(0, 1, 32).reshape(16, 2)``.
+
+Running a program
+=================
+
+Circuits are sampled by a backend, so a program holding a shot loop cannot run in process,
+without a QPU or simulator present. However, a program of only classical operations can be run
+directly without any external tools, which may be helpful for setting up and debugging portions
+of a program. To do this, provide a keyword argument per declared input::
+
+    x = qp_input("x", f64[3])
+    program = build({"z": (x * x).mean(axis=0)})
+    program(x=[1.0, 2.0, 3.0])    # DataTree([z: array(4.66666667)])
 
 Dtypes
 ======
@@ -67,6 +135,8 @@ Functions
 .. autosummary::
    :toctree: ../stubs/
 
+   shot_loop
+   bind_parameters
    qp_input
    constant
    build
@@ -112,6 +182,7 @@ from qiskit._accelerate.quantum_program import (
 from ._tracer import (
     Tracer,
     add,
+    bind_parameters,
     bitwise_and,
     bitwise_not,
     bitwise_or,
@@ -127,6 +198,7 @@ from ._tracer import (
     power,
     qp_input,
     remainder,
+    shot_loop,
     std,
     subtract,
     var,
@@ -153,6 +225,7 @@ __all__ = [
     "TensorType",
     "Tracer",
     "add",
+    "bind_parameters",
     "bit",
     "bitwise_and",
     "bitwise_not",
@@ -178,6 +251,7 @@ __all__ = [
     "power",
     "qp_input",
     "remainder",
+    "shot_loop",
     "std",
     "subtract",
     "u8",

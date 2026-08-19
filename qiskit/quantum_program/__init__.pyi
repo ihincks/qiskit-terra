@@ -22,6 +22,7 @@ from typing import Any, ClassVar
 from ._tracer import (
     Tracer,
     add,
+    bind_parameters,
     bitwise_and,
     bitwise_not,
     bitwise_or,
@@ -37,6 +38,7 @@ from ._tracer import (
     power,
     qp_input,
     remainder,
+    shot_loop,
     std,
     subtract,
     var,
@@ -49,6 +51,7 @@ __all__ = [
     "TensorType",
     "Tracer",
     "add",
+    "bind_parameters",
     "bit",
     "bitwise_and",
     "bitwise_not",
@@ -74,6 +77,7 @@ __all__ = [
     "power",
     "qp_input",
     "remainder",
+    "shot_loop",
     "std",
     "subtract",
     "u8",
@@ -91,6 +95,10 @@ class DataTree:
     __hash__: ClassVar[None]  # type: ignore[assignment]
 
     def __init__(self, object: Any, /) -> None: ...
+    @staticmethod
+    def leaf_of(value: Any, /) -> DataTree:
+        """A leaf holding `value`, which is not parsed."""
+
     @property
     def is_leaf(self) -> bool:
         """Whether this is a leaf, as opposed to a branch of children."""

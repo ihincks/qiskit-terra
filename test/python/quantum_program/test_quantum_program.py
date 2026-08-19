@@ -21,12 +21,14 @@ from collections import OrderedDict, namedtuple
 import numpy as np
 
 import qiskit.quantum_program
+from qiskit.circuit import ClassicalRegister, Parameter, QuantumCircuit, QuantumRegister
 from qiskit.quantum_program import (
     DataTree,
     DType,
     TensorType,
     Tracer,
     add,
+    bind_parameters,
     bit,
     bitwise_and,
     bitwise_not,
@@ -47,6 +49,7 @@ from qiskit.quantum_program import (
     power,
     qp_input,
     remainder,
+    shot_loop,
     std,
     subtract,
     var,
@@ -177,6 +180,12 @@ class TestDataTree(QiskitTestCase):
         """Test that a tree parses to an equal tree."""
         tree = DataTree({"a": [1, 2]})
         self.assertEqual(DataTree(tree), tree)
+
+    def test_leaf_of_holds_a_value_unparsed(self):
+        """Test that a value a constructor would decompose can be held as one leaf."""
+        tree = DataTree.leaf_of([1, 2])
+        self.assertTrue(tree.is_leaf)
+        self.assertEqual(tree.leaf, [1, 2])
 
     def test_hook_decomposes_an_object(self):
         """Test that __datatree__ is used in place of treating the object as a leaf."""
@@ -695,3 +704,222 @@ class TestCallingAProgram(QiskitTestCase):
         """Test that a program renders the structures it declares."""
         program = build({"z": qp_input("x", f64[1])})
         self.assertEqual(repr(program), "QuantumProgram(inputs=[x: _], outputs=[z: _])")
+
+
+class TestCircuits(QiskitTestCase):
+    """Tests for wiring circuits and their parameters into a program."""
+
+    @staticmethod
+    def circuit(parameters=(), registers=(("c", 2),)):
+        """A two-qubit circuit rotating by each of `parameters` and measuring into `registers`.
+
+        Args:
+            parameters: The parameters to rotate by, one instruction each.
+            registers: The classical registers to measure into, as `(name, width)` pairs.
+
+        Returns:
+            The circuit.
+        """
+        cregs = [ClassicalRegister(width, name) for name, width in registers]
+        qubits = QuantumRegister(max([2, *(len(register) for register in cregs)]), "q")
+        circuit = QuantumCircuit(qubits, *cregs)
+        for index, parameter in enumerate(parameters):
+            circuit.rx(parameter, index % 2)
+        for register in cregs:
+            circuit.measure(qubits[: len(register)], register)
+        return circuit
+
+    def test_outcomes_are_a_mapping_per_circuit(self):
+        """Test that a shot loop gives one entry per circuit, keyed by register name."""
+        first = self.circuit(registers=(("a", 1), ("b", 2)))
+        second = self.circuit(registers=(("c", 2),))
+        outcomes = shot_loop([first, second], 8)
+        self.assertEqual(len(outcomes), 2)
+        self.assertEqual(outcomes[0].keys(), ["a", "b"])
+        self.assertEqual(outcomes[0]["a"].type, bit[8, 1])
+        self.assertEqual(outcomes[1]["c"].type, bit[8, 2])
+
+    def test_structure_navigates_like_a_container(self):
+        """Test that a structure of values is indexed and iterated like what it describes."""
+        first = self.circuit(registers=(("a", 1), ("b", 2)))
+        outcomes = shot_loop([first, self.circuit()], 8)
+        entry = outcomes[0]
+        self.assertEqual([len(value) for value in outcomes], [2, 1])
+        self.assertEqual([name for name, _ in entry.items()], ["a", "b"])
+        self.assertEqual([value.type for value in entry.values()], [bit[8, 1], bit[8, 2]])
+        self.assertEqual(outcomes[-1].keys(), ["c"])
+        self.assertIn("b", entry)
+        self.assertNotIn("z", entry)
+        with self.assertRaises(KeyError):
+            _ = entry["z"]
+        with self.assertRaisesRegex(IndexError, "addresses nothing among 2 values"):
+            _ = outcomes[2]
+        with self.assertRaisesRegex(TypeError, "indexed by position"):
+            _ = outcomes["a"]
+
+    def test_one_value_has_no_structure(self):
+        """Test that a single value raises on the container operations but is still a value."""
+        bits = shot_loop([self.circuit()], 8)[0]["c"]
+        for operation in (len, iter, list):
+            with self.assertRaisesRegex(TypeError, r"a single value of type Bit\[8, 2\]"):
+                operation(bits)
+        self.assertTrue(bits)
+
+    def test_a_structure_has_no_type_of_its_own(self):
+        """Test that asking a structure of values for one type says to index into it."""
+        outcomes = shot_loop([self.circuit()], 8)
+        with self.assertRaisesRegex(TypeError, "index into it first"):
+            _ = outcomes.type
+
+    def test_every_value_shares_one_node(self):
+        """Test that the values reached from one shot loop are positions in one node."""
+        outcomes = shot_loop([self.circuit(registers=(("a", 1), ("b", 2)))], 8)
+        program = build({"a": outcomes[0]["a"], "b": outcomes[0]["b"]})
+        self.assertEqual(
+            program._node_type_counts(),
+            {"qiskit.constant": 1, "qiskit.shot_loop": 1, "qiskit.result": 2},
+        )
+
+    def test_outcomes_can_be_the_outputs(self):
+        """Test that a structure of values is built as it is and comes back the same way."""
+        outcomes = shot_loop([self.circuit(registers=(("a", 1), ("b", 2)))], 8)
+        program = build(outcomes)
+        self.assertEqual(program.output_types(), DataTree([{"a": bit[8, 1], "b": bit[8, 2]}]))
+        self.assertEqual(build({"all": outcomes}).output_types()["all.0.b"], bit[8, 2])
+
+    def test_each_value_is_its_own_register(self):
+        """Test that the register indexed out of a shot loop is the one wired into the program."""
+        first = self.circuit(registers=(("a", 1), ("b", 2), ("g", 3)))
+        second = self.circuit(registers=(("d", 4), ("e", 5)))
+        # The circuit in the middle measures nothing, so it contributes no value to index past.
+        outcomes = shot_loop([first, self.circuit(registers=()), second], 8)
+        program = build([outcomes[2]["e"], outcomes[0]["b"], outcomes[2]["d"], outcomes[0]["g"]])
+        self.assertEqual(
+            program.output_types(), DataTree([bit[8, 5], bit[8, 2], bit[8, 4], bit[8, 3]])
+        )
+
+    def test_a_structure_is_not_one_output(self):
+        """Test that a structure held as one leaf is refused, since it is not one value."""
+        outcomes = shot_loop([self.circuit()], 8)
+        with self.assertRaisesRegex(TypeError, "structure of values"):
+            build(DataTree.leaf_of(outcomes))
+
+    def test_batch_axes_carry_onto_the_outcomes(self):
+        """Test that any rank of leading axes on the parameter values reaches the outcomes."""
+        circuit = self.circuit((Parameter("a"),))
+        for shape, batch in ((f64[1], ()), (f64[4, 1], (4,)), (f64[2, 3, 1], (2, 3))):
+            with self.subTest(shape):
+                outcomes = shot_loop([circuit], 8, [qp_input("values", shape)])
+                self.assertEqual(outcomes[0]["c"].type, bit[(*batch, 8, 2)])
+
+    def test_values_of_the_wrong_type_raise_where_written(self):
+        """Test that values that are not a circuit's parameters raise, naming the circuit."""
+        circuit = self.circuit((Parameter("a"), Parameter("b")))
+        with self.assertRaisesRegex(
+            ValueError, r"circuit 0: expected .* \[\.\.\., 2\], got F64\[3\]"
+        ):
+            shot_loop([circuit], 8, [qp_input("values", f64[3])])
+
+    def test_a_circuit_taking_no_parameters_needs_no_values(self):
+        """Test that a circuit taking no parameters is wired in with nothing given for it."""
+        angles = qp_input("angles", f64[4, 1])
+        outcomes = shot_loop([self.circuit((Parameter("a"),)), self.circuit()], 8, [angles, None])
+        self.assertEqual(outcomes[0]["c"].type, bit[4, 8, 2])
+        self.assertEqual(outcomes[1]["c"].type, bit[8, 2], "no values means no batch")
+        # Every circuit taking no parameters shares the one empty set of values.
+        program = build(shot_loop([self.circuit(), self.circuit()], 8))
+        self.assertEqual(program._node_type_counts()["qiskit.constant"], 1)
+
+    def test_one_set_of_values_per_circuit(self):
+        """Test that a shot loop needs one set of parameter values for each of its circuits."""
+        with self.assertRaisesRegex(ValueError, "2 circuits, 1 given"):
+            shot_loop([self.circuit(), self.circuit()], 8, [None])
+
+    def test_a_circuit_taking_parameters_is_not_given_none(self):
+        """Test that leaving out the values of a circuit that takes some raises, naming it."""
+        with self.assertRaisesRegex(
+            ValueError, r"circuit 0: expected .* \[\.\.\., 1\], got F64\[0\]"
+        ):
+            shot_loop([self.circuit((Parameter("a"),))], 8)
+
+    def test_only_circuits_can_be_run(self):
+        """Test that something that is not a circuit is refused, naming it and its type."""
+        with self.assertRaisesRegex(TypeError, "circuit 1: expected a QuantumCircuit, got int"):
+            shot_loop([self.circuit(), 1], 8)
+
+    def test_a_circuit_that_builds_itself_is_built_first(self):
+        """Test that a circuit assembled on demand is assembled before it is wired in."""
+
+        class Lazy(QuantumCircuit):
+            """A circuit that adds its register and its rotation when its data is read."""
+
+            @property
+            def data(self):
+                if not self.cregs:
+                    self.add_register(ClassicalRegister(2, "c"))
+                    self.rx(Parameter("a"), 0)
+                    self.measure([0, 1], [0, 1])
+                return super().data
+
+        outcomes = shot_loop([Lazy(2)], 8, [qp_input("values", f64[1])])
+        self.assertEqual(outcomes[0]["c"].type, bit[8, 2])
+
+    def test_expressions_supply_a_circuits_parameters(self):
+        """Test that expressions evaluated in the program feed a circuit's parameter values."""
+        angle = Parameter("angle")
+        circuit = self.circuit((Parameter("a"), Parameter("b")))
+        values = bind_parameters([angle, 2 * angle], qp_input("angles", f64[3, 1]), [angle])
+        self.assertEqual(values.type, f64[3, 2])
+        self.assertEqual(shot_loop([circuit], 8, [values])[0]["c"].type, bit[3, 8, 2])
+
+    def test_surplus_declared_parameters_accepted(self):
+        """Test that declaring a parameter no expression uses is accepted."""
+        a, b = Parameter("a"), Parameter("b")
+        values = bind_parameters([a], qp_input("x", f64[2]), [a, b])
+        self.assertEqual(values.type, f64[1])
+
+    def test_undeclared_parameter_named(self):
+        """Test that an expression over a parameter that is not declared raises, naming it."""
+        a, b = Parameter("a"), Parameter("b")
+        with self.assertRaisesRegex(ValueError, "undeclared parameter b"):
+            bind_parameters([a + b], qp_input("x", f64[1]), [a])
+
+    def test_expressions_run_in_process(self):
+        """Test that binding parameters is arithmetic the program can perform itself."""
+        angle = Parameter("angle")
+        program = build(bind_parameters([angle, 2 * angle], qp_input("x", f64[2, 1]), [angle]))
+        np.testing.assert_allclose(program(x=[[0.5], [1.5]]).leaf, [[0.5, 1.0], [1.5, 3.0]])
+
+    def test_a_program_of_circuits_needs_a_backend(self):
+        """Test that calling a program holding circuits names the node it cannot perform."""
+        values = qp_input("values", f64[1])
+        program = build(shot_loop([self.circuit((Parameter("a"),))], 8, [values]))
+        with self.assertRaisesRegex(ValueError, r"\(qiskit.shot_loop\) has no built-in"):
+            program(values=[0.5])
+
+    def test_circuits_parameters_and_post_processing_in_one_program(self):
+        """Test that computing parameter values, running circuits and reducing them compose."""
+        angle = Parameter("angle")
+        circuit = self.circuit((Parameter("a"), Parameter("b")), (("meas", 2),))
+        angles = qp_input("angles", f64[16, 1])
+        values = bind_parameters([angle, 2 * angle], angles, [angle])
+        bits = shot_loop([circuit], 1024, [values])[0]["meas"]
+        program = build({"excited": bits.mean(axis=1), "parity": bits.parity(2).mean(1)})
+
+        self.assertEqual(program.input_types(), DataTree({"angles": f64[16, 1]}))
+        self.assertEqual(
+            program.output_types(), DataTree({"excited": f64[16, 2], "parity": f64[16]})
+        )
+        self.assertEqual(
+            program._node_type_counts(),
+            {
+                "qiskit.parameter": 1,
+                "qiskit.bind_parameters": 1,
+                "qiskit.shot_loop": 1,
+                "qiskit.parity": 1,
+                "qiskit.mean": 2,
+                "qiskit.result": 2,
+            },
+        )
+        with self.assertRaisesRegex(ValueError, "has no built-in implementation"):
+            program(angles=np.linspace(0.0, np.pi, 16).reshape(16, 1))

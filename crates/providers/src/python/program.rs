@@ -78,7 +78,7 @@ impl PyProgramFunction {
     ) -> PyResult<Vec<PyValue>> {
         let operands: Vec<Value> = operands.into_iter().map(|value| value.0).collect();
         self.0
-            .add_boxed_node(node_type.0.to_owned(), &operands)
+            .add_boxed_node(node_type.node_type.to_owned(), &operands)
             .map(|values| values.into_iter().map(PyValue).collect())
             .map_err(|error| value_error(&error))
     }

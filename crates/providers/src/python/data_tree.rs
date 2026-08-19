@@ -29,7 +29,7 @@ pub(super) type ObjectTree = DataTree<Py<PyAny>>;
 /// a `dict` becomes a branch named by its keys in insertion order, and a namedtuple becomes a
 /// branch named by its fields. Anything else is a leaf, unless it defines `__datatree__()`, which
 /// is called to obtain the tree to use in its place. A tree holds no record of which container a
-/// name or a position came from.
+/// name or a position came from. `leaf_of()` holds any value as a leaf, without parsing it.
 ///
 /// A child is addressed by its name or by its position, and any value below it by a dotted path of
 /// the two. Reading a child gives the value of a leaf, or a `DataTree` over a subtree::
@@ -56,6 +56,19 @@ impl PyDataTree {
     #[pyo3(signature = (object, /))]
     fn new(object: &Bound<'_, PyAny>) -> PyResult<Self> {
         Ok(Self(parse(object)?))
+    }
+
+    /// A leaf holding `value`, which is not parsed.
+    ///
+    /// Args:
+    ///     value: The value to hold.
+    ///
+    /// Returns:
+    ///     A leaf holding it.
+    #[staticmethod]
+    #[pyo3(signature = (value, /))]
+    fn leaf_of(value: &Bound<'_, PyAny>) -> Self {
+        Self(DataTree::new_leaf(value.clone().unbind()))
     }
 
     /// Whether this is a leaf, as opposed to a branch of children.
