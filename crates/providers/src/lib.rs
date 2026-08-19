@@ -23,9 +23,13 @@
 //! - [`program`] defines [`QuantumProgram`], which is a list of [`ProgramFunction`]s.
 //! - [`data_tree`] defines [`DataTree`], the container for nested structured values used to describe the
 //!   IO contract of a quantum program.
+//! - [`python`] binds the parts of all this that `qiskit.quantum_program` exposes, behind the
+//!   `python` feature.
 pub mod data_tree;
 pub mod ops;
 pub mod program;
+#[cfg(feature = "python")]
+pub mod python;
 pub mod tensor;
 
 pub use data_tree::{ArityMismatch, DataTree, InvalidName, PathEntry, TreeMatchError};
