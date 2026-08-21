@@ -354,8 +354,31 @@ class Tracer:
         """
         return parity(self, axis)
 
+    def listing(self) -> str:
+        """List the program this value would build. Equivalent to :func:`listing(self) <listing>`.
+
+        Returns:
+            A listing of every node the program holds.
+        """
+        return build(self).listing()
+
+    def draw(self) -> Image:
+        """Draw the program this value would build. Equivalent to :func:`draw(self) <draw>`.
+
+        Returns:
+            The drawing, as a ``PIL.Image.Image``.
+        """
+        return build(self).draw()
+
+    def __str__(self) -> str:
+        return self.listing()
+
     def __repr__(self) -> str:
-        return f"Tracer({self._node!r}, {self._types})"
+        # A structure is summarized rather than written out, since its types are as long as it is.
+        if self.is_leaf:
+            return f"Tracer({self._node!r}, {self._types})"
+        count = _leaf_count(self._types)
+        return f"Tracer({self._node!r}, {count} value{'' if count == 1 else 's'})"
 
 
 def qp_input(name: str, type_: TensorType) -> Tracer:
@@ -786,6 +809,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator, Sequence
     from typing import TypeAlias
 
+    from PIL.Image import Image
     from numpy.typing import ArrayLike
 
     from qiskit._accelerate.quantum_program import DType, QuantumProgram, TensorType, Value, bounded

@@ -16,12 +16,14 @@ import ast
 import inspect
 import operator
 import pathlib
+import unittest
 from collections import OrderedDict, namedtuple
 
 import numpy as np
 
 import qiskit.quantum_program
 from qiskit.circuit import ClassicalRegister, Parameter, QuantumCircuit, QuantumRegister
+from qiskit.exceptions import MissingOptionalLibraryError
 from qiskit.quantum_program import (
     DataTree,
     DType,
@@ -40,9 +42,11 @@ from qiskit.quantum_program import (
     cast,
     constant,
     divide,
+    draw,
     f32,
     f64,
     i64,
+    listing,
     mean,
     multiply,
     parity,
@@ -54,6 +58,7 @@ from qiskit.quantum_program import (
     subtract,
     var,
 )
+from qiskit.utils import optionals
 from test import QiskitTestCase  # pylint: disable=wrong-import-order
 
 
@@ -480,6 +485,13 @@ class TestTracer(QiskitTestCase):
         x = qp_input("x", f64[3])
         self.assertEqual(repr(x), "Tracer(input 'x', F64[3])")
         self.assertEqual(repr(x + x), "Tracer(qiskit.add, F64[3])")
+
+    def test_repr_of_a_structure_counts_its_values(self):
+        """Test that a structure of values is summarized rather than written out."""
+        circuit = QuantumCircuit(QuantumRegister(2, "q"), ClassicalRegister(1, "a"))
+        circuit.measure(0, 0)
+        self.assertEqual(repr(shot_loop([circuit], 8)), "Tracer(qiskit.shot_loop, 1 value)")
+        self.assertEqual(repr(shot_loop([circuit] * 3, 8)), "Tracer(qiskit.shot_loop, 3 values)")
 
 
 class TestStandaloneOps(QiskitTestCase):
@@ -923,3 +935,98 @@ class TestCircuits(QiskitTestCase):
         )
         with self.assertRaisesRegex(ValueError, "has no built-in implementation"):
             program(angles=np.linspace(0.0, np.pi, 16).reshape(16, 1))
+
+
+class TestDrawing(QiskitTestCase):
+    """Tests for rendering a program, or one value of one."""
+
+    @staticmethod
+    def shared():
+        """A program whose mean feeds both of its outputs.
+
+        Returns:
+            The program.
+        """
+        excited = qp_input("x", f64[3]).mean(axis=0)
+        return build({"excited": excited, "shifted": excited - 1.0})
+
+    def test_listing_writes_each_node_once(self):
+        """Test that the listing is one line per node, with a shared value written once."""
+        self.assertEqual(
+            self.shared().listing(),
+            "\n".join(
+                [
+                    "@0: // entry point",
+                    "  %0: F64[3] = qiskit.parameter x",
+                    "  %1: F64[] = qiskit.mean[axis=0](%0)",
+                    "  %3: F64[] = qiskit.constant",
+                    "  %4: F64[] = qiskit.subtract(%1, %3)",
+                    "  results:",
+                    "    excited = %1",
+                    "    shifted = %4",
+                ]
+            ),
+        )
+
+    def test_str_is_the_listing(self):
+        """Test that printing a program, or one value of one, gives its listing."""
+        program = self.shared()
+        self.assertEqual(str(program), program.listing())
+        excited = qp_input("x", f64[3]).mean(axis=0)
+        self.assertEqual(str(excited), excited.listing())
+
+    def test_function_and_method_agree(self):
+        """Test that the function, the program's method and a tracer's method all agree."""
+        excited = qp_input("x", f64[3]).mean(axis=0)
+        expected = build(excited).listing()
+        self.assertEqual(listing(excited), expected)
+        self.assertEqual(excited.listing(), expected)
+        self.assertEqual(listing(build(excited)), expected)
+
+    def test_a_value_is_built_before_it_is_drawn(self):
+        """Test that a tracer renders as the program it would build, outputs included."""
+        x = qp_input("x", f64[2])
+        self.assertEqual(
+            listing(x * x),
+            "\n".join(
+                [
+                    "@0: // entry point",
+                    "  %0: F64[2] = qiskit.parameter x",
+                    "  %1: F64[2] = qiskit.multiply(%0, %0)",
+                    "  results:",
+                    "    %1",
+                ]
+            ),
+        )
+
+    def test_a_multi_result_node_names_each_value(self):
+        """Test that a value of a node producing several names the slot it came from."""
+        circuit = QuantumCircuit(QuantumRegister(2, "q"), ClassicalRegister(1, "a"))
+        circuit.measure(0, 0)
+        rendered = listing(shot_loop([circuit, circuit], 8)[1]["a"])
+        # Both circuits take no parameters, so both read the one shared empty constant.
+        self.assertIn(
+            "  %1: (Bit[8, 1], Bit[8, 1]) = qiskit.shot_loop[circuits=2, shots=8](%0, %0)",
+            rendered,
+        )
+        self.assertIn("\n    %1.1", rendered)
+
+    @unittest.skipUnless(optionals.HAS_GRAPHVIZ, "needs Graphviz")
+    @unittest.skipUnless(optionals.HAS_PIL, "needs Pillow")
+    def test_graphviz_gives_an_image(self):
+        """Test that a drawing is laid out as an image."""
+        image = self.shared().draw()
+        self.assertEqual(image.format, "PNG")
+        self.assertGreater(min(image.size), 0)
+        self.assertEqual(draw(qp_input("x", f64[3]).mean(axis=0)).format, "PNG")
+
+    @unittest.skipIf(
+        optionals.HAS_GRAPHVIZ and optionals.HAS_PIL, "both drawing packages are installed"
+    )
+    def test_graphviz_names_what_to_install(self):
+        """Test that a drawing asked for without its packages says what is missing."""
+        program = self.shared()
+        with self.assertRaises(MissingOptionalLibraryError):
+            program.draw()
+        # A listing needs nothing beyond Qiskit, so it is unaffected.
+        self.assertIn("qiskit.mean", program.listing())

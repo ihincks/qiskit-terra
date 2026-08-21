@@ -26,6 +26,7 @@
 //!   function per execution resource, for an implementation that needs its dispatch worked out.
 //! - [`data_tree`] holds [`DataTree`], the container for structured values. A program's inputs and
 //!   outputs arrive in one, arranged by the structures it declares, which is where all naming lives.
+//! - [`render`] writes a program out for a person to read, as a listing or as a drawing.
 //! - [`python`] binds the parts of all this that `qiskit.quantum_program` exposes, behind the
 //!   `python` feature.
 
@@ -34,6 +35,7 @@ pub mod nodes;
 pub mod program;
 #[cfg(feature = "python")]
 pub mod python;
+pub mod render;
 pub mod tensor;
 
 pub use data_tree::{ArityMismatch, DataTree, InvalidName, Name, PathEntry, TreeMatchError};

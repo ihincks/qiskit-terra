@@ -112,11 +112,12 @@ where
 /// Generate the [`OpNodeType`] implementation for a reduction along one axis.
 ///
 /// Each reduction takes one operand, accepts every dtype, and folds along `self.axis`. They differ
-/// only in the dtype they produce and in the fold itself, so each node supplies `$result_dtype` and
-/// an inherent `fn reduce_axis(&self, x: &Tensor) -> Tensor`. `reduce_axis` may assume `self.axis` is
-/// in bounds for `x`.
+/// only in the dtype they produce, in the fold itself and in the fields they have, so each node
+/// supplies `$result_dtype`, the `$field`s it is described by, and an inherent
+/// `fn reduce_axis(&self, x: &Tensor) -> Tensor`. `reduce_axis` may assume `self.axis` is in bounds
+/// for `x`.
 macro_rules! reduction_node {
-    ($name:ident, $node_name:literal, $result_dtype:expr) => {
+    ($name:ident, $node_name:literal, $result_dtype:expr, [$($field:ident),+]) => {
         impl OpNodeType for $name {
             type Error = MathNodeError;
 
@@ -125,6 +126,9 @@ macro_rules! reduction_node {
             }
             fn namespace(&self) -> &str {
                 QISKIT
+            }
+            fn describe(&self) -> Option<String> {
+                Some([$(format!("{}={}", stringify!($field), self.$field)),+].join(", "))
             }
             fn arity(&self) -> usize {
                 1
@@ -194,7 +198,7 @@ impl Mean {
     }
 }
 
-reduction_node!(Mean, "mean", mean_out_dtype);
+reduction_node!(Mean, "mean", mean_out_dtype, [axis]);
 
 /// Variance of a tensor along a specified axis, removing that axis.
 ///
@@ -252,7 +256,7 @@ impl Variance {
     }
 }
 
-reduction_node!(Variance, "variance", real_out_dtype);
+reduction_node!(Variance, "variance", real_out_dtype, [axis, ddof]);
 
 /// Standard deviation of a tensor along a specified axis, removing that axis.
 ///
@@ -281,7 +285,7 @@ impl Std {
     }
 }
 
-reduction_node!(Std, "std", real_out_dtype);
+reduction_node!(Std, "std", real_out_dtype, [axis, ddof]);
 
 #[cfg(test)]
 mod tests {

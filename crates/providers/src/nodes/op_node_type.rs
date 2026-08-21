@@ -71,6 +71,11 @@ pub trait OpNodeType {
         format!("{}.{}", self.namespace(), self.name())
     }
 
+    /// A short string summary of the content of this node, `axis=0` for instance.
+    fn describe(&self) -> Option<String> {
+        None
+    }
+
     /// The number of operand tensors this node consumes.
     fn arity(&self) -> usize;
 
@@ -179,10 +184,13 @@ where
         fn namespace(&self) -> &str {
             self.0.namespace()
         }
-        // Forwarded rather than left to the default, so that a node type overriding it keeps its
-        // own spelling once it is stored in a function.
+        // These two have defaults, and are forwarded so that a node type overriding either keeps
+        // its own answer once it is stored in a function.
         fn full_name(&self) -> String {
             self.0.full_name()
+        }
+        fn describe(&self) -> Option<String> {
+            self.0.describe()
         }
         fn arity(&self) -> usize {
             self.0.arity()

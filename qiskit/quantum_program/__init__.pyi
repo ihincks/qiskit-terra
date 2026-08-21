@@ -17,8 +17,9 @@
 # is imported from the module that defines it, so its types are read from there.
 
 from collections.abc import Iterator, Sequence
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
+from ._render import draw, listing
 from ._tracer import (
     Tracer,
     add,
@@ -65,12 +66,14 @@ __all__ = [
     "cast",
     "constant",
     "divide",
+    "draw",
     "f32",
     "f64",
     "i8",
     "i16",
     "i32",
     "i64",
+    "listing",
     "mean",
     "multiply",
     "parity",
@@ -193,6 +196,13 @@ class QuantumProgram:
     def __call__(self, **inputs: Any) -> DataTree:
         """Evaluate the program on one keyword argument per declared input."""
 
+    def listing(self) -> str:
+        """This program as a listing of every node it holds, one function per block."""
+
+    def draw(self) -> Image:
+        """Draw this program's dataflow as a graph, one box per node."""
+
+    def __str__(self) -> str: ...
     def __repr__(self) -> str: ...
 
 bit: DType
@@ -208,3 +218,6 @@ f32: DType
 f64: DType
 c64: DType
 c128: DType
+
+if TYPE_CHECKING:
+    from PIL.Image import Image

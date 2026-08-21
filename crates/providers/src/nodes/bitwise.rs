@@ -126,6 +126,9 @@ impl OpNodeType for Parity {
     fn namespace(&self) -> &str {
         QISKIT
     }
+    fn describe(&self) -> Option<String> {
+        Some(format!("axis={}", self.axis))
+    }
     fn arity(&self) -> usize {
         1
     }

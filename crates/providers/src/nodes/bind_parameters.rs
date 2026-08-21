@@ -99,6 +99,13 @@ impl OpNodeType for BindParameters {
     fn namespace(&self) -> &str {
         QISKIT
     }
+    fn describe(&self) -> Option<String> {
+        Some(format!(
+            "expressions={}, parameters={}",
+            self.expressions.len(),
+            self.parameters.len()
+        ))
+    }
     fn arity(&self) -> usize {
         1
     }

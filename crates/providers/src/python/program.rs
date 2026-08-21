@@ -24,6 +24,7 @@ use super::tensor::{tensor, tensor_object};
 use super::value_error;
 use crate::data_tree::{DataTree, Name};
 use crate::program::{ProgramFunction, QuantumProgram, Value};
+use crate::render;
 use crate::tensor::TensorType;
 
 /// One tensor value: an output slot of the node that produces it.
@@ -209,6 +210,26 @@ impl PyQuantumProgram {
         )))
     }
 
+    /// This program as a listing of every node it holds, one function per block.
+    ///
+    /// Returns:
+    ///     The listing, which is also what ``str()`` of a program gives.
+    fn listing(&self) -> String {
+        render::listing(&self.0)
+    }
+
+    /// Draw this program's dataflow as a graph, one box per node.
+    ///
+    /// Returns:
+    ///     The drawing, as a ``PIL.Image.Image``.
+    ///
+    /// Raises:
+    ///     MissingOptionalLibraryError: If Graphviz or Pillow is missing.
+    fn draw<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        PyModule::import(py, "qiskit.quantum_program._render")?
+            .call_method1("_image", (render::dot(&self.0),))
+    }
+
     /// How many nodes the program holds of each node type.
     ///
     /// A node has no name of its own, so this is what pins the shape of a built graph.
@@ -220,6 +241,10 @@ impl PyQuantumProgram {
             }
         }
         counts
+    }
+
+    fn __str__(&self) -> String {
+        render::listing(&self.0)
     }
 
     fn __repr__(&self) -> String {

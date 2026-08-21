@@ -15,7 +15,7 @@
 use super::error::MathNodeError;
 use super::inference::broadcast_to;
 use super::{OpNodeType, QISKIT};
-use crate::tensor::{Dim, Tensor, TensorError, TensorType};
+use crate::tensor::{Dim, Tensor, TensorError, TensorType, fmt_shape};
 
 /// Broadcast a tensor to a target shape, right-aligning the two.
 ///
@@ -72,6 +72,9 @@ impl OpNodeType for BroadcastTo {
     }
     fn namespace(&self) -> &str {
         QISKIT
+    }
+    fn describe(&self) -> Option<String> {
+        Some(format!("target={}", fmt_shape(&self.target)))
     }
     fn arity(&self) -> usize {
         1

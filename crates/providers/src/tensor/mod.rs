@@ -27,3 +27,5 @@ pub use dtype::DType;
 pub use error::TensorError;
 pub use tensor_type::{Dim, TensorType};
 pub use value::Tensor;
+
+pub(crate) use tensor_type::fmt_shape;
