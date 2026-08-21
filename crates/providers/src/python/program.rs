@@ -24,6 +24,7 @@ use super::tensor::{tensor, tensor_object};
 use super::value_error;
 use crate::data_tree::DataTree;
 use crate::program::{ProgramFunction, QuantumProgram, Value};
+use crate::render;
 use crate::tensor::TensorType;
 
 /// One tensor value: an output slot of the instruction that produces it.
@@ -215,6 +216,26 @@ impl PyQuantumProgram {
         )))
     }
 
+    /// Return this program as a listing of every instruction it holds, one function per block.
+    ///
+    /// Returns:
+    ///     The listing, which is also what ``str()`` of a program gives.
+    fn listing(&self) -> String {
+        render::listing(&self.0)
+    }
+
+    /// Draw this program's dataflow as a graph, one box per instruction.
+    ///
+    /// Returns:
+    ///     The drawing, as a ``PIL.Image.Image``.
+    ///
+    /// Raises:
+    ///     MissingOptionalLibraryError: If Graphviz or Pillow is missing.
+    fn draw<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        PyModule::import(py, "qiskit.quantum_program._render")?
+            .call_method1("_image", (render::dot(&self.0),))
+    }
+
     /// Return how many instructions the program holds of each op.
     fn _type_name_counts(&self) -> BTreeMap<String, usize> {
         let mut counts = BTreeMap::new();
@@ -224,6 +245,10 @@ impl PyQuantumProgram {
             }
         }
         counts
+    }
+
+    fn __str__(&self) -> String {
+        render::listing(&self.0)
     }
 
     fn __repr__(&self) -> String {

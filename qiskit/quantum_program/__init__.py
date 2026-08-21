@@ -115,6 +115,27 @@ of a program. To do this, provide a keyword argument per declared input::
     program = build({"z": (x * x).mean(axis=0)})
     program(x=[1.0, 2.0, 3.0])    # DataTree([z: array(4.66666667)])
 
+Looking at a program
+====================
+
+A program, or partially constructed program, can be visualized either as a code listing::
+
+    print(program.listing())
+
+which gives::
+
+    @0: // entry point
+      %0: F64[3] = qiskit.parameter x
+      %1: F64[3] = qiskit.multiply(%0, %0)
+      %2: F64[] = qiskit.mean[axis=0](%1)
+      results:
+        z = %2
+
+Or as a data-flow directed acyclic graph, where every edge represents a tensor, and every
+instruction a tensor operation, ``program.draw()``, which needs the optional Graphviz and Pillow
+packages. The
+:func:`listing` and :func:`draw` functions do the same for one :class:`Tracer`.
+
 Operations
 ==========
 
@@ -168,6 +189,8 @@ Functions
    parity
    cast
    broadcast_to
+   draw
+   listing
 
 Classes
 =======
@@ -202,6 +225,7 @@ from qiskit._accelerate.quantum_program import (
 )
 
 from . import ops
+from ._render import draw, listing
 from ._tracer import (
     Tracer,
     add,
@@ -263,12 +287,14 @@ __all__ = [
     "cast",
     "constant",
     "divide",
+    "draw",
     "f32",
     "f64",
     "i8",
     "i16",
     "i32",
     "i64",
+    "listing",
     "mean",
     "multiply",
     "ops",
