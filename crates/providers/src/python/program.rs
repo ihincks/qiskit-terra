@@ -23,9 +23,15 @@ use super::op_node_type::PyOpNodeType;
 use super::tensor::{tensor, tensor_object};
 use super::value_error;
 use crate::data_tree::{DataTree, Name};
-use crate::program::{ProgramFunction, QuantumProgram, Value};
+use crate::program::{ContractionError, ProgramFunction, QuantumProgram, Value, contract};
 use crate::render;
 use crate::tensor::TensorType;
+
+impl From<ContractionError> for PyErr {
+    fn from(err: ContractionError) -> PyErr {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("{err:#}"))
+    }
+}
 
 /// One tensor value: an output slot of the node that produces it.
 #[pyclass(
@@ -137,6 +143,17 @@ impl PyQuantumProgram {
         Ok(PyDataTree(object_tree(&types, |ty| {
             Ok(Py::new(py, ty.clone())?.into_any())
         })?))
+    }
+
+    /// The type of every output, arranged as the program's output structure.
+    ///
+    /// Type inference ran as the program was built, so this needs no evaluation.
+    ///
+    /// Returns:
+    ///     A data tree of tensor types.
+    fn contract(&self, py: Python<'_>, resources: Vec<Vec<String>>) -> PyResult<PyQuantumProgram> {
+        let (contracted, points) = contract(&self.0, resources)?;
+        Ok(PyQuantumProgram(contracted))
     }
 
     /// Evaluate the program on one keyword argument per declared input.

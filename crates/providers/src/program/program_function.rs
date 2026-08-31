@@ -10,6 +10,15 @@
 // copyright notice, and modified files need to carry a notice indicating
 // that they have been altered from the originals.
 
+/// A function within a quantum program.
+///
+/// This file defines several Node related classes, here is a glossary:
+/// Node: the type a ProgramFunction actually owns a Vec of
+/// NodeId: the index of a Node in a function
+/// NodeBody: the non-operand, non-output-type substruct of a Node.
+/// NodeRef: a read-only view of a Node that's in a function
+/// NodeRole: a fast look-up enum to see check what kind of node is at hand (op, param, call, result)
+/// NodeView: similar to NodeRole, but holds data in each arm
 use std::fmt;
 
 use thiserror::Error;
@@ -72,7 +81,10 @@ impl fmt::Display for Value {
     }
 }
 
-/// What part a node plays in its function.
+/// The role a node plays in a function.
+///
+/// This enum is similar to and nearly redundant with [`NodeView`], but implements
+/// equality, has no lifetime parameter, and has no knowledge of the content of the node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeRole {
     /// A function input, supplied by the caller.
@@ -189,7 +201,7 @@ impl NodeBody {
     }
 }
 
-/// One node of a function: what it is, what it reads, and what it produces.
+/// One node of a function.
 struct Node {
     body: NodeBody,
     /// The values this node consumes, in operand order. There are always [`NodeView::arity`] of
@@ -202,8 +214,8 @@ struct Node {
 
 /// A read-only view of one node of a [`ProgramFunction`].
 ///
-/// This holds the function as well as the node, because a node's operand types live on the nodes
-/// that produce them and so cannot be read from the node alone.
+/// A node's operand types are defined by the nodes that produce them. Therefore,
+/// this object holds a reference to the whole function.
 #[derive(Clone, Copy)]
 pub struct NodeRef<'a> {
     function: &'a ProgramFunction,
@@ -517,6 +529,66 @@ impl ProgramFunction {
         let id = self.push(NodeBody::Result, vec![value], Vec::new());
         self.results.push(id);
         Ok(())
+    }
+
+    /// Add a node equivalent to `node`, reading `operands` in place of the operands it has.
+    ///
+    /// `node` may belong to any function, which is what lets one function be copied into another.
+    /// A parameter is redeclared with the same type and takes no operands. A result declares its
+    /// one operand as the next result of this function and produces no values.
+    pub fn add_like(
+        &mut self,
+        node: NodeRef<'_>,
+        operands: &[Value],
+    ) -> Result<Vec<Value>, FunctionError> {
+        match node.view() {
+            NodeView::Op(op) => self.add_boxed_node(op.to_owned(), operands),
+            NodeView::Call(callee) => self.add_call_like(node, callee, operands),
+            NodeView::Parameter => {
+                Ok(vec![self.add_parameter(
+                    node.output_types().first().unwrap().clone(),
+                )])
+            }
+            NodeView::Result => match operands {
+                [operand] => {
+                    self.add_result(*operand)?;
+                    Ok(vec![])
+                }
+                _ => Err(FunctionError::OperandArity {
+                    full_name: node.full_name(),
+                    expected: 1,
+                    actual: operands.len(),
+                }),
+            },
+        }
+    }
+
+    /// Add a call like `node`, naming `callee` rather than the function `node` names.
+    ///
+    /// The results are the ones `node` declares, and renumbering the functions of a program is what
+    /// this is for. Whether `callee` accepts `operands` and produces those results is checked when
+    /// the program is assembled, as it is for any call.
+    pub(super) fn add_call_like(
+        &mut self,
+        node: NodeRef<'_>,
+        callee: FunctionId,
+        operands: &[Value],
+    ) -> Result<Vec<Value>, FunctionError> {
+        for (operand, &value) in operands.iter().enumerate() {
+            if self.type_of(value).is_none() {
+                return Err(FunctionError::UnknownOperand { operand, value });
+            }
+        }
+        let id = self.push(
+            NodeBody::Call(callee),
+            operands.to_vec(),
+            node.output_types().to_vec(),
+        );
+        Ok(self
+            .node(id)
+            .expect("the node was just pushed")
+            .outputs()
+            .collect())
     }
 
     /// Append a node, returning the id it was given.

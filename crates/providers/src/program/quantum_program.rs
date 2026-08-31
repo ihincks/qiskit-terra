@@ -17,7 +17,8 @@ use std::fmt;
 use thiserror::Error;
 
 use super::program_function::{
-    FunctionEvalError, NodeId, NodeRef, NodeRole, NodeView, ProgramFunction, Signature,
+    FunctionError, FunctionEvalError, NodeId, NodeRef, NodeRole, NodeView, ProgramFunction,
+    Signature, Value,
 };
 use crate::data_tree::DataTree;
 use crate::tensor::{Tensor, TensorType};
@@ -339,6 +340,152 @@ impl QuantumProgram {
                     .map(|node| (FunctionId::from_index(index), node))
             })
     }
+
+    /// A copy of this program with the entry point's calls inlined.
+    ///
+    /// `depth` bounds the expansion. `Some(0)` copies the program unchanged, `Some(1)` expands the
+    /// only the entry point's calls, `Some(2)` also expands the calls of calls, etc., and `None`
+    /// expands with full recursion. The entry point's signature and the program's input and
+    /// output structures are the same either way.
+    ///
+    /// A function the new entry point no longer calls is dropped, and the ones that survive are
+    /// renumbered, so a fully inlined program holds the entry point alone. A function this program
+    /// never reached is dropped too.
+    ///
+    /// # Errors
+    /// A callee's parameter type may be wider than the operand a call site supplies, so a body can
+    /// be spliced against types narrower than the ones it was built with. A node that rejects those
+    /// types fails here.
+    pub fn inline_to(&self, depth: Option<usize>) -> Result<Self, FunctionError> {
+        let unchanged: Vec<FunctionId> = (0..self.functions.len())
+            .map(FunctionId::from_index)
+            .collect();
+        let inlined = rebuild(&self.functions, self.entry_function(), depth, &unchanged)?;
+
+        // Where each function the new entry point still reaches lands once the rest are dropped.
+        let mut remap = unchanged;
+        let retained = reachable(&self.functions, &inlined);
+        let mut functions = Vec::with_capacity(retained.len() + 1);
+        for (index, &id) in retained.iter().enumerate() {
+            remap[id.index()] = FunctionId::from_index(index);
+            // A call may only name an earlier function, so working upwards means every callee of
+            // this one is already remapped. A depth of zero expands nothing, so this is a copy.
+            let function = &self.functions[id.index()];
+            functions.push(rebuild(&self.functions, function, Some(0), &remap)?);
+        }
+        functions.push(rebuild(&self.functions, &inlined, Some(0), &remap)?);
+
+        Ok(Self::new(
+            functions,
+            self.input_structure.clone(),
+            self.output_structure.clone(),
+        )
+        .expect("inlining preserves the entry point's boundary and the contract of every call"))
+    }
+}
+
+/// The functions `entry` reaches through the calls it holds, in ascending order.
+fn reachable(functions: &[ProgramFunction], entry: &ProgramFunction) -> Vec<FunctionId> {
+    let mut reached = vec![false; functions.len()];
+    for callee in callees(entry) {
+        reached[callee.index()] = true;
+    }
+    // A call may only name an earlier function, so one downward pass closes the set.
+    for (index, function) in functions.iter().enumerate().rev() {
+        if reached[index] {
+            for callee in callees(function) {
+                reached[callee.index()] = true;
+            }
+        }
+    }
+    (0..functions.len())
+        .filter(|&index| reached[index])
+        .map(FunctionId::from_index)
+        .collect()
+}
+
+/// Every function `function` calls, with a repeat per call site.
+fn callees(function: &ProgramFunction) -> impl Iterator<Item = FunctionId> + '_ {
+    function.iter_nodes().filter_map(|node| match node.view() {
+        NodeView::Call(callee) => Some(callee),
+        _ => None,
+    })
+}
+
+/// A copy of `source` with the calls it holds expanded as `depth` allows, and every call it keeps
+/// pointed at `remap` of the function it named.
+///
+/// `functions` holds the callee of every call `source` may reach.
+fn rebuild(
+    functions: &[ProgramFunction],
+    source: &ProgramFunction,
+    depth: Option<usize>,
+    remap: &[FunctionId],
+) -> Result<ProgramFunction, FunctionError> {
+    let mut rebuilt = ProgramFunction::new();
+    let mut args = Vec::with_capacity(source.parameters().len());
+    for &id in source.parameters() {
+        let parameter = source
+            .node(id)
+            .expect("a parameter belongs to the function that declared it");
+        args.push(rebuilt.add_like(parameter, &[])?[0]);
+    }
+    for value in splice(&mut rebuilt, functions, source, &args, depth, remap)? {
+        rebuilt.add_result(value)?;
+    }
+    Ok(rebuilt)
+}
+
+/// Append the interior of `source` to `destination`, reading `args` in place of `source`'s
+/// parameters and expanding calls as `depth` allows, and return the value of each of `source`'s
+/// results in declaration order.
+///
+/// The boundary of `source` is not copied: its parameters are `args`, and its results are what this
+/// returns. So splicing one function into another leaves the caller's boundary alone.
+fn splice(
+    destination: &mut ProgramFunction,
+    functions: &[ProgramFunction],
+    source: &ProgramFunction,
+    args: &[Value],
+    depth: Option<usize>,
+    remap: &[FunctionId],
+) -> Result<Vec<Value>, FunctionError> {
+    // Where each value of `source` landed in `destination`, by node and then by slot.
+    let mut mapped: Vec<Vec<Value>> = vec![Vec::new(); source.node_count()];
+    for (&id, &arg) in source.parameters().iter().zip(args) {
+        mapped[id.index()] = vec![arg];
+    }
+
+    for node in source.iter_nodes() {
+        if matches!(node.view(), NodeView::Parameter | NodeView::Result) {
+            continue;
+        }
+        // Every operand was produced by an earlier node, so its counterpart is already mapped.
+        let operands: Vec<Value> = node
+            .operands()
+            .iter()
+            .map(|value| mapped[value.node().index()][value.slot()])
+            .collect();
+        mapped[node.id().index()] = match node.view() {
+            NodeView::Call(callee) if depth.is_none_or(|remaining| remaining > 0) => splice(
+                destination,
+                functions,
+                &functions[callee.index()],
+                &operands,
+                depth.map(|remaining| remaining - 1),
+                remap,
+            )?,
+            NodeView::Call(callee) => {
+                destination.add_call_like(node, remap[callee.index()], &operands)?
+            }
+            _ => destination.add_like(node, &operands)?,
+        };
+    }
+
+    Ok(source
+        .result_values()
+        .map(|value| mapped[value.node().index()][value.slot()])
+        .collect())
 }
 
 /// Arrange one value per slot into `structure`, which describes exactly that many slots.
