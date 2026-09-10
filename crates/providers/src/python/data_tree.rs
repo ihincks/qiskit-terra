@@ -304,7 +304,7 @@ fn branch_is_mapping(children: &[(Option<&str>, &ObjectTree)]) -> PyResult<bool>
 }
 
 /// Parse `object` into a data tree, as [`PyDataTree`] documents.
-fn parse(object: &Bound<'_, PyAny>) -> PyResult<ObjectTree> {
+pub(super) fn parse(object: &Bound<'_, PyAny>) -> PyResult<ObjectTree> {
     let py = object.py();
     if let Ok(tree) = object.cast::<PyDataTree>() {
         return Ok(tree.get().0.clone());
