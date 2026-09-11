@@ -801,7 +801,7 @@ mod test {
     }
 
     /// An op with two results: the sum of its operands, and their difference.
-    #[derive(Clone)]
+    #[derive(Clone, Debug)]
     struct SumAndDifference;
 
     impl ProgramOp for SumAndDifference {

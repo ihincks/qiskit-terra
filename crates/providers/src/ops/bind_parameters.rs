@@ -27,7 +27,7 @@ use crate::tensor::{DType, Dim, Tensor, TensorType};
 /// The operand has one value per declared parameter in its trailing axis, and the result has one
 /// value per expression. Leading axes on the operand are a batch prefix and are carried onto the
 /// result.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct BindParameters {
     expressions: Vec<ParameterExpression>,
     parameters: Vec<Symbol>,
