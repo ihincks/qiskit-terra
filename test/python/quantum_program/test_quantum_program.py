@@ -28,6 +28,7 @@ from qiskit.exceptions import MissingOptionalLibraryError
 from qiskit.quantum_program import (
     DataTree,
     DType,
+    InstructionRole,
     TensorType,
     Tracer,
     add,
@@ -1087,6 +1088,110 @@ class TestCircuits(QiskitTestCase):
         )
         with self.assertRaisesRegex(ValueError, "has no built-in implementation"):
             program(angles=np.linspace(0.0, np.pi, 16).reshape(16, 1))
+
+
+class TestReadingAProgram(QiskitTestCase):
+    """Tests for reading a built program back, function by function and instruction by instruction.
+
+    The tracer emits no call, so a program built here holds one function. A callee, a function index
+    other than zero and a function that is not the entry point therefore have no case to test.
+    """
+
+    @staticmethod
+    def program():
+        """A program averaging its one input, so its entry holds a parameter, a mean and a result."""
+        return build({"z": qp_input("x", f64[2, 3]).mean(axis=0)})
+
+    def test_a_program_holds_functions_ending_at_the_entry(self):
+        """Test that a program iterates over its functions and reports which one it starts at."""
+        program = self.program()
+        self.assertEqual(program.num_functions, 1)
+        self.assertEqual([function.index for function in program], [0])
+        self.assertTrue(program.entry.is_entry)
+        self.assertEqual(program.function(-1).index, program.entry.index)
+
+    def test_reading_a_function_out_of_range_raises(self):
+        """Test that addressing no function says so."""
+        with self.assertRaisesRegex(IndexError, "function 1 is out of range"):
+            self.program().function(1)
+
+    def test_a_function_holds_its_instructions_in_run_order(self):
+        """Test that a function is a sequence of instructions, operands before the instruction."""
+        function = self.program().entry
+        self.assertEqual(len(function), 3)
+        self.assertEqual(
+            [instruction.role for instruction in function],
+            [InstructionRole.Parameter, InstructionRole.Op, InstructionRole.Result],
+        )
+        self.assertEqual(
+            [instruction.full_name for instruction in function],
+            ["qiskit.parameter", "qiskit.mean", "qiskit.result"],
+        )
+        self.assertEqual([instruction.id for instruction in function], [0, 1, 2])
+        self.assertEqual(function[-1].full_name, "qiskit.result")
+        with self.assertRaisesRegex(IndexError, "instruction 3 is out of range"):
+            _ = function[3]
+
+    def test_a_functions_boundary_is_its_parameters_and_results(self):
+        """Test that a function reports the instructions declaring its inputs and outputs."""
+        function = self.program().entry
+        self.assertEqual([instruction.id for instruction in function.parameters], [0])
+        self.assertEqual([instruction.id for instruction in function.results], [2])
+        self.assertEqual(function.input_types(), [f64[2, 3]])
+        self.assertEqual(function.output_types(), [f64[3]])
+
+    def test_an_instruction_reports_the_op_it_applies(self):
+        """Test that an op instruction hands back its op and a boundary instruction hands back none."""
+        function = self.program().entry
+        op = function[1].op
+        self.assertIsInstance(op, ops.Mean)
+        self.assertEqual(op.axis, 0)
+        self.assertEqual(function[1].describe, "axis=0")
+        for boundary in (function[0], function[2]):
+            self.assertIsNone(boundary.op)
+            self.assertIsNone(boundary.describe)
+
+    def test_an_instruction_reports_the_types_it_reads_and_writes(self):
+        """Test that an instruction reports its operand types and its own result types."""
+        function = self.program().entry
+        self.assertEqual(function[1].operand_types(), [f64[2, 3]])
+        self.assertEqual(function[1].output_types(), [f64[3]])
+        self.assertEqual(function[0].operand_types(), [])
+        self.assertEqual(function[0].output_types(), [f64[2, 3]])
+
+    def test_a_value_names_the_instruction_producing_it(self):
+        """Test that an operand addresses its producer and the slot within it."""
+        function = self.program().entry
+        (value,) = function[1].operands
+        self.assertEqual((value.instruction, value.slot), (0, 0))
+        producer = function[value.instruction]
+        self.assertEqual(producer.output_types()[value.slot], f64[2, 3])
+        self.assertEqual(producer.outputs, [value])
+
+    def test_a_shot_loops_values_are_its_registers(self):
+        """Test that a shot loop's outputs are one value per register, in circuit order."""
+        first, second = ClassicalRegister(1, "a"), ClassicalRegister(2, "b")
+        circuit = QuantumCircuit(QuantumRegister(2, "q"), first, second)
+        circuit.measure([0], first)
+        circuit.measure([0, 1], second)
+        outcomes = shot_loop([circuit], 8)
+        program = build({"a": outcomes[0]["a"], "b": outcomes[0]["b"]})
+        (loop,) = [
+            instruction
+            for instruction in program.entry
+            if instruction.full_name == "qiskit.shot_loop"
+        ]
+        self.assertEqual(loop.output_types(), [bit[8, 1], bit[8, 2]])
+        self.assertEqual([value.slot for value in loop.outputs], [0, 1])
+        self.assertEqual(loop.op.shots, 8)
+        self.assertEqual(loop.op.circuit(0), circuit)
+
+    def test_repr(self):
+        """Test that a function and an instruction show where they sit."""
+        function = self.program().entry
+        self.assertEqual(repr(function), "ProgramFunction(@0, 3 instructions)")
+        self.assertEqual(repr(function[1]), "Instruction(@0, 1, qiskit.mean)")
+        self.assertEqual(repr(function[1].operands[0]), "Value(%0)")
 
 
 class TestDrawing(QiskitTestCase):

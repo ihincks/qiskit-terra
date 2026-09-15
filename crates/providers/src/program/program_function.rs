@@ -30,6 +30,11 @@ type Slot = u16;
 pub struct InstructionId(u32);
 
 impl InstructionId {
+    /// Return the id of the instruction at `index` of its function.
+    pub fn from_index(index: usize) -> Self {
+        Self(u32::try_from(index).expect("an instruction id fits in a u32"))
+    }
+
     /// Return the underlying index, for use as a dense array subscript.
     pub fn index(self) -> usize {
         self.0 as usize
@@ -72,7 +77,19 @@ impl fmt::Display for Value {
 }
 
 /// What part an instruction plays in its function.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        name = "InstructionRole",
+        module = "qiskit.quantum_program",
+        eq,
+        eq_int,
+        frozen,
+        from_py_object,
+        hash
+    )
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InstructionRole {
     /// A function input, supplied by the caller.
     Parameter,
@@ -130,6 +147,13 @@ impl<'a> InstructionView<'a> {
                 format!("{}.{}", self.namespace(), self.name())
             }
             Self::Op(op) => op.full_name(),
+        }
+    }
+
+    fn describe(self) -> Option<String> {
+        match self {
+            Self::Parameter | Self::Call(_) | Self::Result => None,
+            Self::Op(op) => op.describe(),
         }
     }
 
@@ -233,6 +257,11 @@ impl<'a> InstructionRef<'a> {
     /// `qiskit.add` for instance.
     pub fn full_name(&self) -> String {
         self.view().full_name()
+    }
+
+    /// Return a summary of the op's payload, such as `axis=0`, and `None` for anything else.
+    pub fn describe(&self) -> Option<String> {
+        self.view().describe()
     }
 
     /// Return whether this instruction has a built-in implementation.

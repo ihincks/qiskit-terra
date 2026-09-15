@@ -52,7 +52,6 @@ __all__ = [
     "QuantumProgram",
     "TensorType",
     "Tracer",
-    "Value",
     "add",
     "bind_parameters",
     "bit",
@@ -205,7 +204,105 @@ class QuantumProgram:
     def draw(self) -> Image:
         """Draw this program's dataflow as a graph, one box per instruction."""
 
+    @property
+    def num_functions(self) -> int:
+        """How many functions the program holds."""
+
+    @property
+    def entry(self) -> ProgramFunction:
+        """The entry point, which is the last function the program defines."""
+
+    def function(self, index: int, /) -> ProgramFunction:
+        """Return the function at ``index`` in definition order."""
+
+    def __iter__(self) -> Iterator[ProgramFunction]: ...
     def __str__(self) -> str: ...
+    def __repr__(self) -> str: ...
+
+class ProgramFunction:
+    """One function of a program: what it consumes, what it produces, and the instructions between."""
+
+    @property
+    def index(self) -> int:
+        """Where this function sits in the program's definition order."""
+
+    @property
+    def is_entry(self) -> bool:
+        """Whether this is the program's entry point."""
+
+    def input_types(self) -> list[TensorType]:
+        """Return the type of each parameter, in the order the function takes them."""
+
+    def output_types(self) -> list[TensorType]:
+        """Return the type of each result, in the order the function declares them."""
+
+    @property
+    def parameters(self) -> list[Instruction]:
+        """The instructions declaring this function's parameters, in order."""
+
+    @property
+    def results(self) -> list[Instruction]:
+        """The instructions declaring this function's results, in order."""
+
+    def __len__(self) -> int: ...
+    def __getitem__(self, index: int) -> Instruction: ...
+    def __iter__(self) -> Iterator[Instruction]: ...
+    def __repr__(self) -> str: ...
+
+class Instruction:
+    """One instruction of a program function: what it does, what it reads, and what it produces."""
+
+    @property
+    def id(self) -> int:
+        """This instruction's id, which is its position in the function holding it."""
+
+    @property
+    def role(self) -> InstructionRole:
+        """What part this instruction plays in its function."""
+
+    @property
+    def full_name(self) -> str:
+        """The type name of what this instruction does, qualified by its namespace."""
+
+    @property
+    def describe(self) -> str | None:
+        """A summary of the op's payload, such as `axis=0`, and `None` for anything else."""
+
+    @property
+    def operands(self) -> list[Value]:
+        """The values this instruction consumes, in operand order."""
+
+    @property
+    def outputs(self) -> list[Value]:
+        """The values this instruction produces, in the order it produces them."""
+
+    def operand_types(self) -> list[TensorType]:
+        """Return the type of each operand, read from the instructions producing them."""
+
+    def output_types(self) -> list[TensorType]:
+        """Return the type of each value this instruction produces."""
+
+    @property
+    def op(self) -> ops.ProgramOp | None:
+        """The operation this instruction applies, and `None` for a parameter, a call or a result."""
+
+    @property
+    def callee(self) -> ProgramFunction | None:
+        """The function this instruction calls, and `None` unless it is a call."""
+
+    def __repr__(self) -> str: ...
+
+class InstructionRole:
+    """What part an instruction plays in its function."""
+
+    Parameter: ClassVar[InstructionRole]
+    Op: ClassVar[InstructionRole]
+    Call: ClassVar[InstructionRole]
+    Result: ClassVar[InstructionRole]
+
+    def __eq__(self, other: object) -> bool: ...
+    def __hash__(self) -> int: ...
+    def __int__(self) -> int: ...
     def __repr__(self) -> str: ...
 
 class Value:

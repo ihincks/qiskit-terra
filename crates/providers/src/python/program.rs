@@ -16,14 +16,17 @@ use std::collections::BTreeMap;
 
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyIterator, PyList};
 
 use super::data_tree::{ObjectTree, PyDataTree};
-use super::ops::PyProgramOp;
+use super::ops::{self, PyProgramOp};
 use super::tensor::{tensor, tensor_object};
-use super::value_error;
+use super::{position, value_error};
 use crate::data_tree::DataTree;
-use crate::program::{ProgramFunction, QuantumProgram, Value};
+use crate::program::{
+    FunctionId, InstructionId, InstructionRef, InstructionRole, InstructionView, ProgramFunction,
+    QuantumProgram, Value,
+};
 use crate::render;
 use crate::tensor::TensorType;
 
@@ -236,6 +239,56 @@ impl PyQuantumProgram {
             .call_method1("_image", (render::dot(&self.0),))
     }
 
+    /// How many functions the program holds.
+    #[getter]
+    fn num_functions(&self) -> usize {
+        self.0.functions().len()
+    }
+
+    /// The entry point, which is the last function the program defines.
+    ///
+    /// Returns:
+    ///     A reader over the function the program starts at.
+    #[getter]
+    fn entry(slf: &Bound<'_, Self>) -> PyProgramFunction {
+        PyProgramFunction {
+            program: slf.clone().unbind(),
+            id: slf.get().0.entry(),
+        }
+    }
+
+    /// Return the function at ``index`` in definition order.
+    ///
+    /// A call may only name an earlier function, so the order is one every function could run in,
+    /// ending at the entry point.
+    ///
+    /// Args:
+    ///     index: Which function to read, counted from the end when negative.
+    ///
+    /// Returns:
+    ///     A reader over that function.
+    ///
+    /// Raises:
+    ///     IndexError: If ``index`` addresses no function.
+    #[pyo3(signature = (index, /))]
+    fn function(slf: &Bound<'_, Self>, index: isize) -> PyResult<PyProgramFunction> {
+        let index = position(index, slf.get().0.functions().len(), "function")?;
+        Ok(PyProgramFunction {
+            program: slf.clone().unbind(),
+            id: FunctionId::from_index(index),
+        })
+    }
+
+    fn __iter__<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyIterator>> {
+        let functions: Vec<PyProgramFunction> = (0..slf.get().0.functions().len())
+            .map(|index| PyProgramFunction {
+                program: slf.clone().unbind(),
+                id: FunctionId::from_index(index),
+            })
+            .collect();
+        PyList::new(slf.py(), functions)?.into_any().try_iter()
+    }
+
     /// Return how many instructions the program holds of each op.
     fn _type_name_counts(&self) -> BTreeMap<String, usize> {
         let mut counts = BTreeMap::new();
@@ -256,6 +309,239 @@ impl PyQuantumProgram {
             "QuantumProgram(inputs={}, outputs={})",
             self.0.input_structure(),
             self.0.output_structure()
+        )
+    }
+}
+
+/// One function of a program: what it consumes, what it produces, and the instructions between.
+///
+/// A reader holds the program rather than a copy of the function, and resolves through it on every
+/// access. Its instructions are in an order every one of them could run in, so an instruction's
+/// operands always come from earlier in the function.
+#[pyclass(name = "ProgramFunction", module = "qiskit.quantum_program", frozen)]
+pub struct PyProgramFunction {
+    program: Py<PyQuantumProgram>,
+    id: FunctionId,
+}
+
+impl PyProgramFunction {
+    /// Return the function this reads.
+    fn read(&self) -> &ProgramFunction {
+        self.program
+            .get()
+            .0
+            .function(self.id)
+            .expect("a reader is only made for a function its program holds")
+    }
+
+    /// Return a reader over the instruction at `id` of this function.
+    fn instruction_at(&self, id: InstructionId) -> PyInstruction {
+        PyInstruction {
+            program: self.program.clone(),
+            function: self.id,
+            id,
+        }
+    }
+}
+
+#[pymethods]
+impl PyProgramFunction {
+    /// Where this function sits in the program's definition order.
+    #[getter]
+    fn index(&self) -> usize {
+        self.id.index()
+    }
+
+    /// Whether this is the program's entry point.
+    #[getter]
+    fn is_entry(&self) -> bool {
+        self.id == self.program.get().0.entry()
+    }
+
+    /// Return the type of each parameter, in the order the function takes them.
+    ///
+    /// Returns:
+    ///     One tensor type per parameter.
+    fn input_types(&self) -> Vec<TensorType> {
+        self.read().signature().inputs
+    }
+
+    /// Return the type of each result, in the order the function declares them.
+    ///
+    /// Returns:
+    ///     One tensor type per result.
+    fn output_types(&self) -> Vec<TensorType> {
+        self.read().signature().outputs
+    }
+
+    /// The instructions declaring this function's parameters, in order.
+    #[getter]
+    fn parameters(&self) -> Vec<PyInstruction> {
+        self.read()
+            .parameters()
+            .iter()
+            .map(|&id| self.instruction_at(id))
+            .collect()
+    }
+
+    /// The instructions declaring this function's results, in order.
+    #[getter]
+    fn results(&self) -> Vec<PyInstruction> {
+        self.read()
+            .results()
+            .iter()
+            .map(|&id| self.instruction_at(id))
+            .collect()
+    }
+
+    fn __len__(&self) -> usize {
+        self.read().instruction_count()
+    }
+
+    fn __getitem__(&self, index: isize) -> PyResult<PyInstruction> {
+        let index = position(index, self.read().instruction_count(), "instruction")?;
+        Ok(self.instruction_at(InstructionId::from_index(index)))
+    }
+
+    fn __iter__<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyIterator>> {
+        let reader = slf.get();
+        let instructions: Vec<PyInstruction> = reader
+            .read()
+            .iter_instructions()
+            .map(|instruction| reader.instruction_at(instruction.id()))
+            .collect();
+        PyList::new(slf.py(), instructions)?.into_any().try_iter()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "ProgramFunction(@{}, {} instructions)",
+            self.id.index(),
+            self.read().instruction_count()
+        )
+    }
+}
+
+/// One instruction of a program function: what it does, what it reads, and what it produces.
+#[pyclass(name = "Instruction", module = "qiskit.quantum_program", frozen)]
+pub struct PyInstruction {
+    program: Py<PyQuantumProgram>,
+    function: FunctionId,
+    id: InstructionId,
+}
+
+impl PyInstruction {
+    /// Return the instruction this reads.
+    fn read(&self) -> InstructionRef<'_> {
+        self.program
+            .get()
+            .0
+            .function(self.function)
+            .expect("a reader is only made for a function its program holds")
+            .instruction(self.id)
+            .expect("a reader is only made for an instruction its function holds")
+    }
+}
+
+#[pymethods]
+impl PyInstruction {
+    /// This instruction's id, which is its position in the function holding it.
+    #[getter]
+    fn id(&self) -> usize {
+        self.id.index()
+    }
+
+    /// What part this instruction plays in its function.
+    #[getter]
+    fn role(&self) -> InstructionRole {
+        self.read().role()
+    }
+
+    /// The type name of what this instruction does, qualified by its namespace.
+    ///
+    /// A backend dispatches on this name. A parameter, a call and a result report
+    /// ``qiskit.parameter``, ``qiskit.call`` and ``qiskit.result``.
+    #[getter]
+    fn full_name(&self) -> String {
+        self.read().full_name()
+    }
+
+    /// A summary of the op's payload, such as ``axis=0``, and ``None`` for anything else.
+    #[getter]
+    fn describe(&self) -> Option<String> {
+        self.read().describe()
+    }
+
+    /// The values this instruction consumes, in operand order.
+    #[getter]
+    fn operands(&self) -> Vec<PyValue> {
+        self.read()
+            .operands()
+            .iter()
+            .copied()
+            .map(PyValue)
+            .collect()
+    }
+
+    /// The values this instruction produces, in the order it produces them.
+    #[getter]
+    fn outputs(&self) -> Vec<PyValue> {
+        self.read().outputs().map(PyValue).collect()
+    }
+
+    /// Return the type of each operand, read from the instructions producing them.
+    ///
+    /// Returns:
+    ///     One tensor type per operand.
+    fn operand_types(&self) -> Vec<TensorType> {
+        self.read().operand_types().cloned().collect()
+    }
+
+    /// Return the type of each value this instruction produces.
+    ///
+    /// These are flat: how an operation arranges its results is its own to report, and a built
+    /// program keeps only the program's own input and output structures.
+    ///
+    /// Returns:
+    ///     One tensor type per value produced.
+    fn output_types(&self) -> Vec<TensorType> {
+        self.read().output_types().to_vec()
+    }
+
+    /// The operation this instruction applies, and ``None`` for a parameter, a call or a result.
+    ///
+    /// Returns:
+    ///     The op, as the class of its type, or the ``ProgramOp`` base class for an op defined
+    ///     outside Qiskit.
+    #[getter]
+    fn op<'py>(slf: &Bound<'py, Self>) -> PyResult<Option<Bound<'py, PyAny>>> {
+        match slf.get().read().view() {
+            InstructionView::Op(op) => ops::op_object(slf.py(), op.to_owned()).map(Some),
+            _ => Ok(None),
+        }
+    }
+
+    /// The function this instruction calls, and ``None`` unless it is a call.
+    ///
+    /// Returns:
+    ///     A reader over the callee.
+    #[getter]
+    fn callee(slf: &Bound<'_, Self>) -> Option<PyProgramFunction> {
+        match slf.get().read().view() {
+            InstructionView::Call(callee) => Some(PyProgramFunction {
+                program: slf.get().program.clone(),
+                id: callee,
+            }),
+            _ => None,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Instruction(@{}, {}, {})",
+            self.function.index(),
+            self.id.index(),
+            self.read().full_name()
         )
     }
 }

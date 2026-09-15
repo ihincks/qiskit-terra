@@ -17,9 +17,10 @@ mod ops;
 mod program;
 mod tensor;
 
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyIndexError, PyValueError};
 use pyo3::prelude::*;
 
+use crate::program::InstructionRole;
 use crate::tensor::{DType, TensorType};
 pub use data_tree::PyDataTree;
 use ops::{
@@ -27,7 +28,7 @@ use ops::{
     PyCast, PyConstant, PyDivide, PyMean, PyMultiply, PyParity, PyPower, PyProgramOp, PyRemainder,
     PyShotLoop, PyStd, PySubtract, PyVariance,
 };
-use program::{PyFunctionBuilder, PyQuantumProgram, PyValue};
+use program::{PyFunctionBuilder, PyInstruction, PyProgramFunction, PyQuantumProgram, PyValue};
 use tensor::PyBounded;
 
 /// Return `error` and everything that caused it, as one message.
@@ -44,9 +45,21 @@ fn chain(error: &dyn std::error::Error) -> String {
     message
 }
 
-/// `error` as a `ValueError`.
+/// Return `error` as a `ValueError`.
 fn value_error(error: &dyn std::error::Error) -> PyErr {
     PyValueError::new_err(chain(error))
+}
+
+/// Return the position `index` addresses among `length` items of kind `what`, counting from the end
+/// when `index` is negative.
+pub(super) fn position(index: isize, length: usize, what: &str) -> PyResult<usize> {
+    let refuse = || PyIndexError::new_err(format!("{what} {index} is out of range"));
+    let length = isize::try_from(length).map_err(|_| refuse())?;
+    let shifted = if index < 0 { index + length } else { index };
+    (0..length)
+        .contains(&shifted)
+        .then(|| usize::try_from(shifted).expect("a position in range is not negative"))
+        .ok_or_else(refuse)
 }
 
 /// Register the `quantum_program` submodule.
@@ -54,8 +67,11 @@ pub fn quantum_program(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBounded>()?;
     m.add_class::<PyDataTree>()?;
     m.add_class::<PyFunctionBuilder>()?;
+    m.add_class::<PyInstruction>()?;
+    m.add_class::<PyProgramFunction>()?;
     m.add_class::<PyQuantumProgram>()?;
     m.add_class::<PyValue>()?;
+    m.add_class::<InstructionRole>()?;
     m.add_class::<DType>()?;
     m.add_class::<TensorType>()?;
     // The op catalogue, whose base class must be registered before the classes extending it.

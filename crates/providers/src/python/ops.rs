@@ -17,7 +17,7 @@
 //! the author of a program and the reader of one.
 
 use pyo3::PyClass;
-use pyo3::exceptions::{PyIndexError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
@@ -30,7 +30,7 @@ use qiskit_circuit::parameter::symbol_expr::Symbol;
 
 use super::data_tree::{ObjectTree, PyDataTree};
 use super::tensor::{parse_shape, shape_object, tensor, tensor_view};
-use super::{chain, value_error};
+use super::{chain, position, value_error};
 use crate::InvalidName;
 use crate::data_tree::DataTree;
 use crate::ops::{
@@ -157,7 +157,51 @@ where
     O: ProgramOp + Clone + Send + Sync + 'static,
     O::Error: std::error::Error + Send + Sync + 'static,
 {
-    PyClassInitializer::from(PyProgramOp { op: Box::new(op) }).add_subclass(class)
+    init_boxed(Box::new(op), class)
+}
+
+/// Initialize `class`, one of the classes of the catalogue, over the op `op` already boxed.
+fn init_boxed<C>(op: BoxedProgramOp, class: C) -> PyClassInitializer<C>
+where
+    C: PyClass<BaseType = PyProgramOp>,
+{
+    PyClassInitializer::from(PyProgramOp { op }).add_subclass(class)
+}
+
+/// Wrap `op` as the class that reads it.
+///
+/// An op defined outside this crate has no class of its own, so it reads back as the base class,
+/// which reports its name and a summary of its payload and nothing else.
+pub(super) fn op_object<'py>(py: Python<'py>, op: BoxedProgramOp) -> PyResult<Bound<'py, PyAny>> {
+    macro_rules! known {
+        ($($op:ty => $class:expr),* $(,)?) => {
+            $(if op.downcast_ref::<$op>().is_some() {
+                return Ok(Bound::new(py, init_boxed(op, $class))?.into_any());
+            })*
+        };
+    }
+    known!(
+        Add => PyAdd,
+        Subtract => PySubtract,
+        Multiply => PyMultiply,
+        Divide => PyDivide,
+        Remainder => PyRemainder,
+        Power => PyPower,
+        BitwiseAnd => PyBitwiseAnd,
+        BitwiseOr => PyBitwiseOr,
+        BitwiseXor => PyBitwiseXor,
+        BitwiseNot => PyBitwiseNot,
+        Parity => PyParity,
+        Mean => PyMean,
+        Variance => PyVariance,
+        Std => PyStd,
+        Cast => PyCast,
+        BroadcastTo => PyBroadcastTo,
+        Constant => PyConstant,
+        ShotLoop => PyShotLoop,
+        BindParameters => PyBindParameters,
+    );
+    Ok(Bound::new(py, PyProgramOp { op })?.into_any())
 }
 
 /// Define the class of an operation that has no payload of its own.
@@ -659,16 +703,4 @@ fn quantum_circuit<'py>(py: Python<'py>, data: &CircuitData) -> PyResult<Bound<'
     QUANTUM_CIRCUIT
         .get_bound(py)
         .call_method1(intern!(py, "_from_circuit_data"), (data,))
-}
-
-/// The position `index` addresses among `length` items of kind `what`, counting from the end when
-/// `index` is negative.
-fn position(index: isize, length: usize, what: &str) -> PyResult<usize> {
-    let refuse = || PyIndexError::new_err(format!("{what} {index} is out of range"));
-    let length = isize::try_from(length).map_err(|_| refuse())?;
-    let shifted = if index < 0 { index + length } else { index };
-    (0..length)
-        .contains(&shifted)
-        .then(|| usize::try_from(shifted).expect("a position in range is not negative"))
-        .ok_or_else(refuse)
 }

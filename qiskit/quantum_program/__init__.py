@@ -136,6 +136,31 @@ instruction a tensor operation, ``program.draw()``, which needs the optional Gra
 packages. The
 :func:`listing` and :func:`draw` functions do the same for one :class:`Tracer`.
 
+Reading a program
+=================
+
+A built program is readable instruction by instruction. It holds one or more
+:class:`ProgramFunction`, ending at the entry point, and each function is a sequence of
+:class:`Instruction`::
+
+    for instruction in program.entry:
+        print(instruction.role, instruction.full_name, instruction.output_types())
+
+An instruction's operands are :class:`Value` objects, which refer positionally to
+a previous instruction, and to one of that instruction's results::
+
+    for value in instruction.operands:
+        producer = function[value.instruction]
+        value_type = producer.output_types()[value.slot]
+
+Each operation is a member of :mod:`qiskit.quantum_program.ops`::
+
+    match instruction.op:
+        case ops.ShotLoop() as op:
+            sample(op.circuits(), op.shots)
+        case ops.Mean() as op:
+            average(op.axis)
+
 Operations
 ==========
 
@@ -200,6 +225,9 @@ Classes
 
    DataTree
    DType
+   Instruction
+   InstructionRole
+   ProgramFunction
    QuantumProgram
    TensorType
    Tracer
@@ -218,6 +246,9 @@ Submodules
 from qiskit._accelerate.quantum_program import (
     DataTree,
     DType,
+    Instruction,
+    InstructionRole,
+    ProgramFunction,
     QuantumProgram,
     TensorType,
     Value,
@@ -268,6 +299,9 @@ c128 = DType.C128
 __all__ = [
     "DType",
     "DataTree",
+    "Instruction",
+    "InstructionRole",
+    "ProgramFunction",
     "QuantumProgram",
     "TensorType",
     "Tracer",
