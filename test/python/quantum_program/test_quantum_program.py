@@ -13,6 +13,7 @@
 """Tests for the public surface of qiskit.quantum_program."""
 
 import ast
+import gc
 import inspect
 import operator
 import pathlib
@@ -613,6 +614,77 @@ class TestOps(QiskitTestCase):
         """Test that the base class is a base rather than an operation."""
         with self.assertRaises(TypeError):
             ops.ProgramOp()
+
+    def test_describe_summarizes_the_payload(self):
+        """Test that an operation with a payload summarizes it and one without says nothing."""
+        self.assertEqual(ops.Mean(1).describe, "axis=1")
+        self.assertEqual(ops.Variance(1, 1.5).describe, "axis=1, ddof=1.5")
+        self.assertEqual(ops.Cast(i64).describe, "target=I64")
+        self.assertEqual(ops.BroadcastTo([4, 2]).describe, "target=[4, 2]")
+        self.assertIsNone(ops.Add().describe)
+
+    def test_reductions_report_their_payload(self):
+        """Test that a reduction reports the axis it folds along and its degrees of freedom."""
+        self.assertEqual(ops.Mean(2).axis, 2)
+        self.assertEqual(ops.Parity(1).axis, 1)
+        self.assertEqual((ops.Variance(0).axis, ops.Variance(0).ddof), (0, 0.0))
+        self.assertEqual((ops.Std(1, 1.5).axis, ops.Std(1, ddof=1.5).ddof), (1, 1.5))
+
+    def test_cast_and_broadcast_report_their_target(self):
+        """Test that a cast reports its dtype and a broadcast its shape."""
+        self.assertEqual(ops.Cast(bit).target, bit)
+        self.assertEqual(ops.BroadcastTo([4, bounded(2)]).target, (4, bounded(2)))
+
+    def test_shot_loop_reports_its_circuits_and_shots(self):
+        """Test that a shot loop reports how many shots it runs and which circuits."""
+        first = self.measured("a")
+        second = self.measured("b", 2)
+        op = ops.ShotLoop([first, second], 64)
+        self.assertEqual(op.shots, 64)
+        self.assertEqual(op.num_circuits, 2)
+        self.assertEqual(op.circuit(1), second)
+        self.assertEqual(op.circuit(-2), first)
+        self.assertEqual(op.circuits(), [first, second])
+        with self.assertRaisesRegex(IndexError, "circuit 2 is out of range"):
+            op.circuit(2)
+
+    def test_constant_value_is_a_read_only_view(self):
+        """Test that a constant lends its buffer out as an array nothing can write to."""
+        op = ops.Constant(np.arange(3.0))
+        value = op.value
+        np.testing.assert_array_equal(value, [0.0, 1.0, 2.0])
+        self.assertIs(value.base, op)
+        self.assertFalse(value.flags.writeable)
+        with self.assertRaises(ValueError):
+            value[0] = 9.0
+        with self.assertRaises(ValueError):
+            value.flags.writeable = True
+
+    def test_a_bit_constant_reads_back_as_bool(self):
+        """Test that a bit-valued constant crosses as a read-only array of bool."""
+        value = ops.Constant(np.array([True, False])).value
+        self.assertEqual(value.dtype, np.bool_)
+        self.assertFalse(value.flags.writeable)
+
+    def test_a_view_keeps_its_constant_alive(self):
+        """Test that the array holds the op whose buffer it reads."""
+        value = ops.Constant(np.arange(4.0)).value
+        gc.collect()
+        np.testing.assert_array_equal(value, [0.0, 1.0, 2.0, 3.0])
+
+    def test_a_constant_lends_its_buffer_twice(self):
+        """Test that two live views of one constant read the same buffer."""
+        op = ops.Constant(np.arange(2.0))
+        first, second = op.value, op.value
+        np.testing.assert_array_equal(first, second)
+        self.assertIs(first.base, second.base)
+
+    def test_bind_parameters_reports_its_payload(self):
+        """Test that a bind reports the expressions it evaluates and the parameters they take."""
+        a, b = Parameter("a"), Parameter("b")
+        op = ops.BindParameters([a + b, 2 * a], [a, b])
+        self.assertEqual(op.expressions, [a + b, 2 * a])
+        self.assertEqual(op.parameters, [a, b])
 
     def test_output_types_of_one_result_is_a_leaf(self):
         """Test that an operation producing one value gives its type as a leaf."""

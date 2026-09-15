@@ -17,15 +17,19 @@
 //! the author of a program and the reader of one.
 
 use pyo3::PyClass;
-use pyo3::exceptions::{PyTypeError, PyValueError};
+use pyo3::exceptions::{PyIndexError, PyTypeError, PyValueError};
 use pyo3::intern;
 use pyo3::prelude::*;
+use pyo3::types::PyTuple;
 use qiskit_circuit::circuit_data::{CircuitData, PyCircuitData};
-use qiskit_circuit::parameter::parameter_expression::{PyParameter, PyParameterExpression};
+use qiskit_circuit::imports::QUANTUM_CIRCUIT;
+use qiskit_circuit::parameter::parameter_expression::{
+    ParameterExpression, PyParameter, PyParameterExpression,
+};
 use qiskit_circuit::parameter::symbol_expr::Symbol;
 
 use super::data_tree::{ObjectTree, PyDataTree};
-use super::tensor::{parse_shape, tensor};
+use super::tensor::{parse_shape, shape_object, tensor, tensor_view};
 use super::{chain, value_error};
 use crate::InvalidName;
 use crate::data_tree::DataTree;
@@ -54,6 +58,16 @@ pub struct PyProgramOp {
 }
 
 impl PyProgramOp {
+    /// Return the op this holds, which is always of type `O`.
+    ///
+    /// Each class of the catalogue builds its base with an op of one type, and every class here is
+    /// frozen, so the type it was built with is the type it holds.
+    fn payload<O: ProgramOp + 'static>(&self) -> &O {
+        self.op
+            .downcast_ref()
+            .expect("a class of the catalogue holds an op of its own type")
+    }
+
     /// Arrange `values`, one per result this operation produces, as it arranges its results.
     ///
     /// A shot loop is the one operation that arranges its results, and it says how. One result is a
@@ -90,6 +104,12 @@ impl PyProgramOp {
     #[getter]
     fn full_name(&self) -> String {
         self.op.full_name()
+    }
+
+    /// A summary of the payload, such as ``axis=0``, and ``None`` for an operation with none.
+    #[getter]
+    fn describe(&self) -> Option<String> {
+        self.op.describe()
     }
 
     /// Return the types this operation produces from operands of type ``operands``, arranged as it
@@ -260,6 +280,12 @@ impl PyParity {
     fn new(axis: usize) -> PyClassInitializer<Self> {
         init(Parity::new(axis), Self)
     }
+
+    /// The axis this XOR-reduces along.
+    #[getter]
+    fn axis(slf: &Bound<'_, Self>) -> usize {
+        slf.as_super().get().payload::<Parity>().axis()
+    }
 }
 
 /// Average a tensor along one axis, removing that axis.
@@ -282,6 +308,12 @@ impl PyMean {
     #[pyo3(signature = (axis, /))]
     fn new(axis: usize) -> PyClassInitializer<Self> {
         init(Mean::new(axis), Self)
+    }
+
+    /// The axis this averages along.
+    #[getter]
+    fn axis(slf: &Bound<'_, Self>) -> usize {
+        slf.as_super().get().payload::<Mean>().axis()
     }
 }
 
@@ -307,6 +339,18 @@ impl PyVariance {
     fn new(axis: usize, ddof: f64) -> PyClassInitializer<Self> {
         init(Variance::new(axis, ddof), Self)
     }
+
+    /// The axis this takes the variance along.
+    #[getter]
+    fn axis(slf: &Bound<'_, Self>) -> usize {
+        slf.as_super().get().payload::<Variance>().axis()
+    }
+
+    /// The delta degrees of freedom, subtracted from the divisor.
+    #[getter]
+    fn ddof(slf: &Bound<'_, Self>) -> f64 {
+        slf.as_super().get().payload::<Variance>().ddof()
+    }
 }
 
 /// Standard deviation of a tensor along one axis, removing that axis.
@@ -331,6 +375,18 @@ impl PyStd {
     fn new(axis: usize, ddof: f64) -> PyClassInitializer<Self> {
         init(Std::new(axis, ddof), Self)
     }
+
+    /// The axis this takes the standard deviation along.
+    #[getter]
+    fn axis(slf: &Bound<'_, Self>) -> usize {
+        slf.as_super().get().payload::<Std>().axis()
+    }
+
+    /// The delta degrees of freedom, subtracted from the divisor.
+    #[getter]
+    fn ddof(slf: &Bound<'_, Self>) -> f64 {
+        slf.as_super().get().payload::<Std>().ddof()
+    }
 }
 
 /// Reinterpret a tensor as another dtype, keeping its shape.
@@ -351,6 +407,12 @@ impl PyCast {
     #[pyo3(signature = (target, /))]
     fn new(target: DType) -> PyClassInitializer<Self> {
         init(Cast::new(target), Self)
+    }
+
+    /// The dtype this casts to.
+    #[getter]
+    fn target(slf: &Bound<'_, Self>) -> DType {
+        slf.as_super().get().payload::<Cast>().target()
     }
 }
 
@@ -374,6 +436,13 @@ impl PyBroadcastTo {
     fn new(target: &Bound<'_, PyAny>) -> PyResult<PyClassInitializer<Self>> {
         Ok(init(BroadcastTo::new(parse_shape(target)?), Self))
     }
+
+    /// The shape this broadcasts to.
+    #[getter]
+    fn target<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyTuple>> {
+        let base = slf.as_super().get();
+        shape_object(slf.py(), base.payload::<BroadcastTo>().target())
+    }
 }
 
 /// Supply a tensor the program holds, rather than one given at call time.
@@ -394,6 +463,23 @@ impl PyConstant {
     #[pyo3(signature = (value, /))]
     fn new(value: &Bound<'_, PyAny>) -> PyResult<PyClassInitializer<Self>> {
         Ok(init(Constant::new(tensor(value)?), Self))
+    }
+
+    /// The tensor this supplies, as a read-only array over the op's own buffer.
+    ///
+    /// A bit-valued tensor is a copy, because NumPy spells a bit ``bool``.
+    #[getter]
+    fn value<'py>(slf: &Bound<'py, Self>) -> Bound<'py, PyAny> {
+        let base = slf.as_super();
+        // SAFETY: the base class owns the boxed op that owns this tensor, and both classes are
+        // frozen, so no mutable reference to the buffer exists. The array holds a reference to the
+        // object, so the buffer stays alive.
+        unsafe {
+            tensor_view(
+                base.get().payload::<Constant>().value(),
+                base.clone().into_any(),
+            )
+        }
     }
 }
 
@@ -445,6 +531,54 @@ impl PyShotLoop {
         let op = ShotLoop::new(circuits, shots).map_err(|error| value_error(&error))?;
         Ok(init(op, Self))
     }
+
+    /// How many shots each circuit runs for.
+    #[getter]
+    fn shots(slf: &Bound<'_, Self>) -> usize {
+        slf.as_super().get().payload::<ShotLoop>().shots()
+    }
+
+    /// How many circuits this runs, which is how many operands it takes.
+    #[getter]
+    fn num_circuits(slf: &Bound<'_, Self>) -> usize {
+        slf.as_super().get().payload::<ShotLoop>().circuits().len()
+    }
+
+    /// Return the circuit at ``index``.
+    ///
+    /// Only a circuit's data is stored, so the circuit given back has neither the name nor the
+    /// metadata of the one it was built from.
+    ///
+    /// Args:
+    ///     index: Which circuit to read, counted from the end when negative.
+    ///
+    /// Returns:
+    ///     A copy of that circuit.
+    ///
+    /// Raises:
+    ///     IndexError: If ``index`` addresses no circuit.
+    #[pyo3(signature = (index, /))]
+    fn circuit<'py>(slf: &Bound<'py, Self>, index: isize) -> PyResult<Bound<'py, PyAny>> {
+        let base = slf.as_super().get();
+        let circuits = base.payload::<ShotLoop>().circuits();
+        let index = position(index, circuits.len(), "circuit")?;
+        quantum_circuit(slf.py(), &circuits[index])
+    }
+
+    /// Return every circuit this runs, in the order it takes its operands.
+    ///
+    /// Each call copies every circuit, as :meth:`circuit` copies one.
+    ///
+    /// Returns:
+    ///     A copy of each circuit.
+    fn circuits<'py>(slf: &Bound<'py, Self>) -> PyResult<Vec<Bound<'py, PyAny>>> {
+        let base = slf.as_super().get();
+        base.payload::<ShotLoop>()
+            .circuits()
+            .iter()
+            .map(|data| quantum_circuit(slf.py(), data))
+            .collect()
+    }
 }
 
 /// Evaluate each of several parameter expressions over a batch of values for some parameters.
@@ -491,5 +625,50 @@ impl PyBindParameters {
             BindParameters::new(expressions, parameters).map_err(|error| value_error(&error))?;
         Ok(init(op, Self))
     }
+
+    /// The expressions this evaluates, in the order it produces their values.
+    #[getter]
+    fn expressions<'py>(slf: &Bound<'py, Self>) -> PyResult<Vec<Bound<'py, PyAny>>> {
+        let base = slf.as_super().get();
+        base.payload::<BindParameters>()
+            .expressions()
+            .iter()
+            .map(|expression| {
+                Ok(ParameterExpression::clone(expression)
+                    .into_pyobject(slf.py())?
+                    .into_any())
+            })
+            .collect()
+    }
+
+    /// The parameters the values are for, in the order the operand holds them.
+    #[getter]
+    fn parameters<'py>(slf: &Bound<'py, Self>) -> PyResult<Vec<Bound<'py, PyAny>>> {
+        let base = slf.as_super().get();
+        base.payload::<BindParameters>()
+            .parameters()
+            .iter()
+            .map(|symbol| PyParameter::from(Symbol::clone(symbol)).into_pyobject(slf.py()))
+            .collect()
+    }
 }
 
+/// Return a new Python QuantumCircuit whose data is a clone of `data`.
+fn quantum_circuit<'py>(py: Python<'py>, data: &CircuitData) -> PyResult<Bound<'py, PyAny>> {
+    let data = PyCircuitData::from(CircuitData::clone(data));
+    QUANTUM_CIRCUIT
+        .get_bound(py)
+        .call_method1(intern!(py, "_from_circuit_data"), (data,))
+}
+
+/// The position `index` addresses among `length` items of kind `what`, counting from the end when
+/// `index` is negative.
+fn position(index: isize, length: usize, what: &str) -> PyResult<usize> {
+    let refuse = || PyIndexError::new_err(format!("{what} {index} is out of range"));
+    let length = isize::try_from(length).map_err(|_| refuse())?;
+    let shifted = if index < 0 { index + length } else { index };
+    (0..length)
+        .contains(&shifted)
+        .then(|| usize::try_from(shifted).expect("a position in range is not negative"))
+        .ok_or_else(refuse)
+}
