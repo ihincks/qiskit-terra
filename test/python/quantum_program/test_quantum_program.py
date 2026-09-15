@@ -1287,3 +1287,94 @@ class TestDrawing(QiskitTestCase):
             program.draw()
         # A listing needs nothing beyond Qiskit, so it is unaffected.
         self.assertIn("qiskit.mean", program.listing())
+
+
+class TestPartitioning(QiskitTestCase):
+    """Tests for putting each execution resource's work into a function of its own."""
+
+    @staticmethod
+    def program():
+        """A program sampling one circuit and averaging the outcomes.
+
+        Returns:
+            The program.
+        """
+        circuit = QuantumCircuit(2, 2)
+        circuit.measure([0, 1], [0, 1])
+        return build({"excited": shot_loop([circuit], 8)[0]["c"].mean(axis=0)})
+
+    def test_declared_work_moves_into_its_own_function(self):
+        """Test that a declared op becomes a function the entry point calls once."""
+        parts, resources = self.program().partition([["qiskit.shot_loop"]])
+        self.assertEqual(resources, [0])
+        self.assertEqual(parts.num_functions, 2)
+        self.assertEqual(
+            [instruction.full_name for instruction in parts.function(0)],
+            ["qiskit.parameter", "qiskit.shot_loop", "qiskit.result"],
+        )
+        self.assertEqual(
+            [instruction.full_name for instruction in parts.entry],
+            ["qiskit.constant", "qiskit.call", "qiskit.mean", "qiskit.result"],
+            "the mean is undeclared, so the entry point keeps it beside the call",
+        )
+
+    def test_a_listing_shows_the_call_and_the_work_left_behind(self):
+        """Test that the rewritten program reads as one block per function."""
+        parts, _ = self.program().partition([["qiskit.shot_loop"]])
+        self.assertEqual(
+            parts.listing(),
+            "\n".join(
+                [
+                    "@0:",
+                    "  %0: F64[0] = qiskit.parameter",
+                    "  %1: Bit[8, 2] = qiskit.shot_loop[circuits=1, shots=8](%0)",
+                    "  results:",
+                    "    %1",
+                    "",
+                    "@1: // entry point",
+                    "  %0: F64[0] = qiskit.constant",
+                    "  %1: Bit[8, 2] = qiskit.call @0(%0)",
+                    "  %2: F64[2] = qiskit.mean[axis=0](%1)",
+                    "  results:",
+                    "    excited = %2",
+                ]
+            ),
+        )
+
+    def test_the_table_pairs_up_with_the_functions(self):
+        """Test that the table describes every function but the entry point, in the same order."""
+        parts, resources = self.program().partition([["qiskit.shot_loop"], ["qiskit.mean"]])
+        self.assertEqual(resources, [0, 1])
+        self.assertEqual(len(resources), parts.num_functions - 1)
+        self.assertEqual(
+            [(resource, function.index) for resource, function in zip(resources, parts)],
+            [(0, 0), (1, 1)],
+        )
+
+    def test_a_partitioned_program_declares_and_computes_the_same(self):
+        """Test that partitioning changes neither what a program takes nor what it gives back."""
+        x = qp_input("x", f64[3])
+        program = build({"z": (x * x).mean(axis=0)})
+        parts, resources = program.partition([["qiskit.multiply"]])
+        self.assertEqual(resources, [0])
+        self.assertEqual(parts.input_types(), program.input_types())
+        self.assertEqual(parts.output_types(), program.output_types())
+        np.testing.assert_array_equal(
+            parts(x=[1.0, 2.0, 3.0])["z"], program(x=[1.0, 2.0, 3.0])["z"]
+        )
+
+    def test_partitioning_twice_is_refused(self):
+        """Test that a program already holding a call cannot be partitioned again."""
+        parts, _ = self.program().partition([["qiskit.shot_loop"]])
+        with self.assertRaisesRegex(ValueError, "calls another function at instruction 1"):
+            parts.partition([["qiskit.shot_loop"]])
+
+    def test_two_resources_cannot_declare_one_op(self):
+        """Test that an op belongs to one resource."""
+        with self.assertRaisesRegex(ValueError, "resource 0 and resource 1 both handle"):
+            self.program().partition([["qiskit.mean"], ["qiskit.mean"]])
+
+    def test_an_op_nothing_can_run_is_refused(self):
+        """Test that leaving work in the entry point that Qiskit cannot perform is refused."""
+        with self.assertRaisesRegex(ValueError, "no resource handles qiskit.shot_loop"):
+            self.program().partition([["qiskit.mean"]])

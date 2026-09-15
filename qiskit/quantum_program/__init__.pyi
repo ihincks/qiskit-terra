@@ -190,16 +190,19 @@ class QuantumProgram:
     """A hybrid quantum-classical computation, described rather than performed."""
 
     def input_types(self) -> DataTree:
-        """The declared type of every input, arranged as the program's input structure."""
+        """Return the declared type of every input, arranged as the program's input structure."""
 
     def output_types(self) -> DataTree:
-        """The type of every output, arranged as the program's output structure."""
+        """Return the type of every output, arranged as the program's output structure."""
 
     def __call__(self, **inputs: Any) -> DataTree:
         """Evaluate the program on one keyword argument per declared input."""
 
+    def partition(self, resources: Sequence[Sequence[str]], /) -> tuple[QuantumProgram, list[int]]:
+        """Rewrite this program to put each execution resource's work in a function of its own."""
+
     def listing(self) -> str:
-        """This program as a listing of every instruction it holds, one function per block."""
+        """Return this program as a listing."""
 
     def draw(self) -> Image:
         """Draw this program's dataflow as a graph, one box per instruction."""

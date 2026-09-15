@@ -27,8 +27,8 @@ use crate::program::{
     FunctionId, InstructionId, InstructionRef, InstructionRole, InstructionView, ProgramFunction,
     QuantumProgram, Value,
 };
-use crate::render;
 use crate::tensor::TensorType;
+use crate::{partition, render};
 
 /// One tensor value: an output slot of the instruction that produces it.
 #[pyclass(
@@ -217,6 +217,29 @@ impl PyQuantumProgram {
         Ok(PyDataTree(structure.unflatten(arrays).expect(
             "a structure has one leaf per leaf of the tree it came from",
         )))
+    }
+
+    /// Rewrite this program to put each execution resource's work in a function of its own.
+    ///
+    /// Each such function is called once from the entry point. Operations not declared by any
+    /// resource stay in the entry function.
+    ///
+    /// Args:
+    ///     resources: The op names each execution resource handles, one sequence per resource, as
+    ///         specified by ``Instruction.full_name``.
+    ///
+    /// Returns:
+    ///     The rewritten program, and the resource each of its functions belongs to.
+    ///
+    /// Raises:
+    ///     ValueError: If this program's entry point already calls a function, if two resources
+    ///         declare one op, or if an op no resource declares is one Qiskit cannot evaluate in
+    ///         process.
+    #[pyo3(signature = (resources, /))]
+    fn partition(&self, resources: Vec<Vec<String>>) -> PyResult<(Self, Vec<usize>)> {
+        partition(&self.0, resources)
+            .map(|(program, table)| (Self(program), table))
+            .map_err(|error| value_error(&error))
     }
 
     /// Return this program as a listing of every instruction it holds, one function per block.

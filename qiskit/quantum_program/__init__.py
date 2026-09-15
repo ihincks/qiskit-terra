@@ -161,6 +161,23 @@ Each operation is a member of :mod:`qiskit.quantum_program.ops`::
         case ops.Mean() as op:
             average(op.axis)
 
+Partitioning a program
+======================
+
+A backend with more than one execution resource, such as a QPU beside a classical processor, can have
+each resource's work put into a function of its own. Declaring the ops each resource handles gives
+back an equivalent program, plus the resource each of its functions belongs to::
+
+    parts, resources = program.partition([["qiskit.multiply"]])
+    parts.num_functions           # 2
+    resources                     # [0]
+
+An op no resource declares stays in the entry point, where Qiskit evaluates it in process, so here
+the mean is left where it was and only the multiplication is handed anywhere. Each function the
+partition produces is called once from the entry point and can be run as a whole. The table holds one
+entry per function other than the entry point, which is the last, so ``zip(resources, parts)`` pairs
+each function with the resource that handles it.
+
 Operations
 ==========
 
